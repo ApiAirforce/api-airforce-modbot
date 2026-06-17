@@ -1,0 +1,8 @@
+target
+.git
+.github
+*.redb
+*.redb.lock
+# never bake secrets / local state into the image
+config.toml
+README.md

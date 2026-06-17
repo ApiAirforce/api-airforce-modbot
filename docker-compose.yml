@@ -1,0 +1,21 @@
+services:
+  modbot:
+    build: .
+    # Or pull a prebuilt image instead of building:
+    # image: ghcr.io/apiairforce/api-airforce-modbot:latest
+    container_name: airforce-modbot
+    restart: unless-stopped
+    environment:
+      # Put your token in a .env file next to this compose file:
+      #   DISCORD_TOKEN=your-bot-token
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?set DISCORD_TOKEN in a .env file}
+    volumes:
+      # Your bootstrap config (guild_id / owner_ids). The token comes from the
+      # env var above, so this file does NOT need to contain it.
+      - ./config.toml:/data/config.toml:ro
+      # Persists the embedded database (strikes, jails, runtime config) across
+      # restarts.
+      - modbot-data:/data
+
+volumes:
+  modbot-data:
