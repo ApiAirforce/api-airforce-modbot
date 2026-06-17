@@ -1,0 +1,25 @@
+# api-airforce-modbot — bootstrap configuration.
+#
+# Only START-UP settings live here. The day-to-day moderation settings
+# (whitelist, strike threshold, exemptions, jail role/channel, …) are managed at
+# RUNTIME via the bot's admin slash commands and stored in the embedded database
+# — you do NOT edit or restart for those.
+#
+# Copy this file to `config.toml` and fill it in. NEVER commit your real
+# `config.toml` (it is git-ignored).
+
+# Discord bot token. Prefer the DISCORD_TOKEN environment variable in production
+# so the secret never lands in a file. If both are set, the env var wins.
+# token = "YOUR_BOT_TOKEN"
+
+# The guild (server) the bot operates in. Enable Developer Mode in Discord, then
+# right-click your server icon → "Copy Server ID". Slash commands register here.
+guild_id = "000000000000000000"
+
+# Discord user IDs allowed to run the admin slash commands, IN ADDITION to anyone
+# who already has the "Manage Server" permission. Optional — leave empty to rely
+# purely on the Manage Server permission.
+owner_ids = []
+
+# Path to the embedded database file (created on first run).
+db_path = "modbot.redb"

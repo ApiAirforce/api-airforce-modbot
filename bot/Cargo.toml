@@ -1,0 +1,14 @@
+[package]
+name = "airforce-modbot"
+description = "Self-hostable Discord moderation bot: anti-advertising link filter, escape-proof role-snapshot jail, and strikes. Backs the api.airforce community."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "airforce-modbot"
+
+[dependencies]
+airforce-modbot-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
