@@ -14,3 +14,6 @@ serde.workspace = true
 serde_json.workspace = true
 redb = "2"
 toml = "0.8"
+serenity = "0.12"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+chrono = "0.4"
