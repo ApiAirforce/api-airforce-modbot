@@ -4,6 +4,7 @@
 //! gateway and runs the moderation event handler (anti-ad link filter +
 //! escape-proof jail + strikes). Runtime configuration is done via slash commands.
 
+mod commands;
 mod config;
 mod handler;
 mod jail;

@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serenity::all::{
-    Context, EventHandler, GuildId, GuildMemberUpdateEvent, Member, Message, Ready, RoleId, UserId,
+    Context, EventHandler, GuildId, GuildMemberUpdateEvent, Interaction, Member, Message, Ready,
+    RoleId, UserId,
 };
 use serenity::async_trait;
 
@@ -17,8 +18,8 @@ use airforce_modbot_core::link_filter::offending_hosts;
 use airforce_modbot_core::{JailStore, LinkFilterConfig, StrikeStore};
 
 use crate::config::BotConfig;
-use crate::jail;
 use crate::store::RedbStore;
+use crate::{commands, jail};
 
 pub struct Handler {
     pub store: Arc<RedbStore>,
@@ -43,6 +44,18 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ connected as {} ({})", ready.user.name, ready.user.id);
 
+        // Register the admin slash commands for the configured guild.
+        match self.config.guild_id.parse::<u64>() {
+            Ok(gid) => commands::register(&ctx, GuildId::new(gid)).await,
+            Err(_) if self.config.guild_id.is_empty() => {
+                eprintln!("⚠️ no guild_id in config — slash commands not registered")
+            }
+            Err(_) => eprintln!(
+                "⚠️ config guild_id `{}` is not a valid id — slash commands not registered",
+                self.config.guild_id
+            ),
+        }
+
         // Spawn the timed-jail expiry sweep exactly once. Uses a Context cloned
         // from this event so it needs no separate token handling.
         if !self.sweep_started.swap(true, Ordering::SeqCst) {
@@ -64,6 +77,13 @@ impl EventHandler for Handler {
                     }
                 }
             });
+        }
+    }
+
+    /// Admin slash commands (runtime configuration).
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::Command(cmd) = interaction {
+            commands::dispatch(&ctx, &cmd, &self.store, &self.config).await;
         }
     }
 
