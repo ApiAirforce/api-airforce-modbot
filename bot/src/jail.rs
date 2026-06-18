@@ -14,6 +14,32 @@ fn parse_role(cfg: &JailConfig) -> Option<RoleId> {
     cfg.jail_role_id.trim().parse::<u64>().ok().map(RoleId::new)
 }
 
+/// The role set a jailed member should end up with: the jail role PLUS any of the
+/// member's **managed** roles (bot-integration / Nitro Booster). Managed roles
+/// cannot be removed through the member-edit endpoint, so omitting them makes
+/// Discord reject the whole edit with `Missing Permissions` — meaning a Booster
+/// (or a bot) could otherwise never be jailed. Best-effort: if the member or the
+/// guild roles can't be fetched, fall back to just the jail role.
+async fn jailed_role_set(
+    ctx: &Context,
+    guild_id: GuildId,
+    user_id: UserId,
+    jail_role: RoleId,
+) -> Vec<RoleId> {
+    let mut roles = vec![jail_role];
+    if let (Ok(member), Ok(guild_roles)) = (
+        guild_id.member(&ctx.http, user_id).await,
+        guild_id.roles(&ctx.http).await,
+    ) {
+        for r in &member.roles {
+            if *r != jail_role && guild_roles.get(r).is_some_and(|role| role.managed) {
+                roles.push(*r);
+            }
+        }
+    }
+    roles
+}
+
 /// Snapshot → strip → persist → DM. Re-jailing an already-jailed user refreshes
 /// the sentence but keeps the original role snapshot. `minutes = None` uses the
 /// config default; `Some(0)` is indefinite.
@@ -60,8 +86,10 @@ pub async fn jail_member<S: JailStore + ConfigStore + Sync>(
     let expires = if mins == 0 { None } else { Some(now + mins as i64 * 60) };
     store.record_jail(&uid, &cfg.guild_id, &prior, reason, jailed_by, now, expires)?;
 
-    // 3) Strip everything: set the member's roles to JUST the jail role.
-    let builder = EditMember::new().roles(vec![jail_role]).audit_log_reason("jail");
+    // 3) Strip to the jail role (preserving managed roles — see jailed_role_set).
+    let builder = EditMember::new()
+        .roles(jailed_role_set(ctx, guild_id, user_id, jail_role).await)
+        .audit_log_reason("jail");
     if let Err(e) = guild_id.edit_member(&ctx.http, user_id, builder).await {
         if existing.is_none() {
             let _ = store.remove_jail(&uid);
@@ -153,7 +181,7 @@ pub async fn reapply_if_jailed<S: JailStore + ConfigStore + Sync>(
         return;
     };
     let builder = EditMember::new()
-        .roles(vec![jail_role])
+        .roles(jailed_role_set(ctx, guild_id, user_id, jail_role).await)
         .audit_log_reason("jail: re-applied on rejoin");
     match guild_id.edit_member(&ctx.http, user_id, builder).await {
         Ok(_) => println!("🔒 re-jailed {uid} on rejoin"),
