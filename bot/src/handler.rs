@@ -15,7 +15,7 @@ use serenity::all::{
 use serenity::async_trait;
 
 use airforce_modbot_core::link_filter::offending_hosts;
-use airforce_modbot_core::{JailStore, LinkFilterConfig, StrikeStore};
+use airforce_modbot_core::{JailConfig, JailStore, LinkFilterConfig, StrikeStore};
 
 use crate::config::BotConfig;
 use crate::store::RedbStore;
@@ -54,6 +54,28 @@ impl EventHandler for Handler {
                 "⚠️ config guild_id `{}` is not a valid id — slash commands not registered",
                 self.config.guild_id
             ),
+        }
+
+        // Seed the per-feature config `guild_id` from the bot's configured guild
+        // if it is still unset. The monorepo populated this via its admin API;
+        // the standalone bot is single-guild, so the filter and jail apply to the
+        // guild in `config.toml`. Without this the message filter and the manual
+        // jail-role watcher gate on an empty `guild_id` and never fire.
+        if !self.config.guild_id.is_empty() {
+            let mut lf = LinkFilterConfig::load(&*self.store);
+            if lf.guild_id.is_empty() {
+                lf.guild_id = self.config.guild_id.clone();
+                if let Err(e) = lf.save(&*self.store) {
+                    eprintln!("⚠️ could not seed link-filter guild_id: {e}");
+                }
+            }
+            let mut jc = JailConfig::load(&*self.store);
+            if jc.guild_id.is_empty() {
+                jc.guild_id = self.config.guild_id.clone();
+                if let Err(e) = jc.save(&*self.store) {
+                    eprintln!("⚠️ could not seed jail guild_id: {e}");
+                }
+            }
         }
 
         // Spawn the timed-jail expiry sweep exactly once. Uses a Context cloned
