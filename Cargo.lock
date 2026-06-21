@@ -24,6 +24,7 @@ dependencies = [
  "airforce-modbot-core",
  "chrono",
  "redb",
+ "reqwest",
  "serde",
  "serde_json",
  "serenity",

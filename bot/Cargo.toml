@@ -17,3 +17,6 @@ toml = "0.8"
 serenity = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 chrono = "0.4"
+# Only used to peek at a dsc.gg vanity's redirect target (Location header) when
+# resolving invite shorteners; shares serenity's rustls TLS backend.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

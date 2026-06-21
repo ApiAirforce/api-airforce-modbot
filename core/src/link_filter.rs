@@ -388,6 +388,40 @@ pub fn extract_discord_invites(text: &str) -> Vec<String> {
     out
 }
 
+// The dsc.gg vanity slug captured from the path. dsc.gg slugs allow an
+// underscore in addition to the discord-code alphabet.
+static DSC_PATH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^/([A-Za-z0-9_-]{1,64})").unwrap());
+
+/// `dsc.gg`, the popular Discord-invite *vanity shortener* (apex or any
+/// subdomain). A look-alike like `mydsc.gg` is rejected.
+fn is_dsc_gg_host(host: &str) -> bool {
+    host == "dsc.gg" || host.ends_with(".dsc.gg")
+}
+
+/// Distinct **dsc.gg vanity slugs** mentioned in `text` (`dsc.gg/SLUG`). dsc.gg
+/// is exclusively a Discord-invite shortener: the slug 302-redirects to a real
+/// `discord.gg/CODE`. The pure core only *detects* the slug (host-anchored, same
+/// as [`extract_discord_invites`]); resolving the redirect to its underlying
+/// invite + guild is the gateway's job (a network call). Order-preserving,
+/// de-duplicated. Slugs are kept verbatim (case preserved) for the allowlist
+/// fast-path.
+pub fn extract_dsc_gg_codes(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for caps in URL_RE.captures_iter(text) {
+        let host = normalize_host(&caps["host"]);
+        if !is_dsc_gg_host(&host) {
+            continue;
+        }
+        let path = caps.name("path").map(|m| m.as_str()).unwrap_or("");
+        if let Some(slug) = DSC_PATH_RE.captures(path).and_then(|c| c.get(1)).map(|m| m.as_str()) {
+            if !slug.is_empty() && !out.iter().any(|s| s == slug) {
+                out.push(slug.to_string());
+            }
+        }
+    }
+    out
+}
+
 // ── Strike decay math ────────────────────────────────────────────────────
 
 /// Given the time of the last recorded strike, `now`, and the decay window,
@@ -626,6 +660,22 @@ mod tests {
             extract_discord_invites("see example.com and then join discord.gg/realinvite"),
             vec!["realinvite".to_string()],
         );
+    }
+
+    #[test]
+    fn extracts_dsc_gg_vanity_slugs_host_anchored() {
+        // dsc.gg slugs are detected (host-anchored), underscore allowed, deduped.
+        assert_eq!(
+            extract_dsc_gg_codes("join https://dsc.gg/my_server and dsc.gg/my_server and dsc.gg/Other-1"),
+            vec!["my_server".to_string(), "Other-1".to_string()],
+        );
+        // buried in a foreign URL's path/query → not a dsc.gg link
+        assert!(extract_dsc_gg_codes("https://example.com/r?u=dsc.gg/abc").is_empty());
+        // look-alike apex rejected
+        assert!(extract_dsc_gg_codes("mydsc.gg/abc").is_empty());
+        // a discord.gg link is NOT a dsc.gg slug (and vice-versa)
+        assert!(extract_dsc_gg_codes("discord.gg/abc").is_empty());
+        assert!(extract_discord_invites("dsc.gg/abc").is_empty());
     }
 
     #[test]

@@ -226,11 +226,11 @@ impl EventHandler for Handler {
 
         // 2) record the strike (atomic + decay-aware).
         let reason = match offending_invite.as_deref() {
-            Some(code) if offenders.is_empty() => {
-                format!("ad: non-whitelisted Discord invite discord.gg/{code}")
+            Some(form) if offenders.is_empty() => {
+                format!("ad: non-whitelisted Discord invite {form}")
             }
-            Some(code) => {
-                format!("ad: links {} + Discord invite discord.gg/{code}", offenders.join(", "))
+            Some(form) => {
+                format!("ad: links {} + Discord invite {form}", offenders.join(", "))
             }
             None => format!("ad link: {}", offenders.join(", ")),
         };
