@@ -399,8 +399,9 @@ fn is_dsc_gg_host(host: &str) -> bool {
 }
 
 /// Distinct **dsc.gg vanity slugs** mentioned in `text` (`dsc.gg/SLUG`). dsc.gg
-/// is exclusively a Discord-invite shortener: the slug 302-redirects to a real
-/// `discord.gg/CODE`. The pure core only *detects* the slug (host-anchored, same
+/// is primarily a Discord-invite shortener: a slug typically 302-redirects to a
+/// real `discord.gg/CODE` (a non-Discord destination simply fails open at the
+/// gateway). The pure core only *detects* the slug (host-anchored, same
 /// as [`extract_discord_invites`]); resolving the redirect to its underlying
 /// invite + guild is the gateway's job (a network call). Order-preserving,
 /// de-duplicated. Slugs are kept verbatim (case preserved) for the allowlist

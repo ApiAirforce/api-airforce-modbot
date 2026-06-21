@@ -15,15 +15,17 @@ use airforce_modbot_core::LinkFilterConfig;
 
 /// A redirect-following-disabled HTTP client used only to peek at where a
 /// `dsc.gg/<slug>` vanity points (its `Location` header) without chasing the
-/// redirect chain. Short timeout + graceful fallback so a slow/broken dsc.gg
-/// never stalls or panics the moderation path.
-static NOREDIRECT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+/// redirect chain. Short timeout so a slow/broken dsc.gg never stalls the
+/// moderation path. `None` if the hardened client can't be built — we then skip
+/// dsc.gg resolution entirely (fail-open) rather than fall back to a permissive
+/// client that would follow redirects (SSRF) and have no timeout.
+static NOREDIRECT_HTTP: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(4))
         .user_agent("DiscordBot (https://api.airforce, 1.0)")
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .ok()
 });
 
 /// How long a resolved verdict is trusted before re-querying Discord. Keeps the
@@ -86,7 +88,10 @@ async fn invite_code_allowed(ctx: &Context, code: &str, cfg: &LinkFilterConfig) 
 /// points at a real Discord invite, judge that invite's guild. Fail-open at every
 /// step (network error, no redirect, redirect not to a Discord invite).
 async fn dsc_gg_slug_allowed(ctx: &Context, slug: &str, cfg: &LinkFilterConfig) -> bool {
-    let resp = match NOREDIRECT_HTTP.get(format!("https://dsc.gg/{slug}")).send().await {
+    let Some(client) = NOREDIRECT_HTTP.as_ref() else {
+        return true; // no hardened client → skip resolution, fail-open
+    };
+    let resp = match client.get(format!("https://dsc.gg/{slug}")).send().await {
         Ok(r) => r,
         Err(_) => return true,
     };
@@ -97,6 +102,12 @@ async fn dsc_gg_slug_allowed(ctx: &Context, slug: &str, cfg: &LinkFilterConfig) 
     let Some(location) = location else {
         return true;
     };
+    // Bound the header we scan (the HTTP stack already caps header size; this
+    // keeps detection independent of that default).
+    let location = location
+        .char_indices()
+        .nth(2048)
+        .map_or(location, |(i, _)| &location[..i]);
     match extract_discord_invites(location).into_iter().next() {
         Some(code) => invite_code_allowed(ctx, &code, cfg).await,
         None => true,
@@ -141,6 +152,9 @@ pub async fn first_offending_invite(
 
     // 2) dsc.gg vanity shorteners → resolve the redirect to the real invite.
     for slug in extract_dsc_gg_codes(text) {
+        // dsc.gg slugs share the `allowed_invite_codes` namespace with real
+        // invite codes (no separate slug allowlist). Fine for a best-effort
+        // filter; revisit if partner curation grows.
         if cfg.is_invite_code_allowed(&slug) {
             continue;
         }
