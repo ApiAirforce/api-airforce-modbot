@@ -69,6 +69,25 @@ pub struct LinkFilterConfig {
     /// their own threshold instead of the global `strike_threshold`.
     #[serde(default)]
     pub user_thresholds: Vec<UserThreshold>,
+    /// Master switch for the Discord-invite sub-filter, independent of the host
+    /// whitelist. When on, a Discord *server invite* (`discord.gg/CODE`,
+    /// `discord.com/invite/CODE`, …) is allowed ONLY if its code is in
+    /// `allowed_invite_codes` or it resolves to an allowed guild (the filter's
+    /// own `guild_id` plus `allowed_guild_ids`); every other server invite is
+    /// treated as advertising and deleted + struck. Default off (opt-in).
+    #[serde(default)]
+    pub filter_invites: bool,
+    /// Fast-path allowlist of permitted Discord invite codes (the Airforce
+    /// vanity + any curated partner invites). An invite whose code is listed
+    /// here is allowed without a network lookup. Case-sensitive — Discord invite
+    /// codes are (vanities are lowercased by Discord).
+    #[serde(default)]
+    pub allowed_invite_codes: Vec<String>,
+    /// Guild ids (snowflakes) whose invites are permitted IN ADDITION to the
+    /// filter's own `guild_id`. The gateway resolves an unknown invite code to
+    /// its guild and allows it when that guild is the own guild or listed here.
+    #[serde(default)]
+    pub allowed_guild_ids: Vec<String>,
 }
 
 /// One (user, channel) exemption pair — see `LinkFilterConfig::exempt_user_channels`.
@@ -106,6 +125,9 @@ impl Default for LinkFilterConfig {
             exempt_role_ids: Vec::new(),
             exempt_user_channels: Vec::new(),
             user_thresholds: Vec::new(),
+            filter_invites: false,
+            allowed_invite_codes: Vec::new(),
+            allowed_guild_ids: Vec::new(),
         }
     }
 }
@@ -147,6 +169,12 @@ impl LinkFilterConfig {
         if self.user_thresholds.len() > 1000 {
             return Err("user_thresholds capped at 1000 entries".into());
         }
+        if self.allowed_invite_codes.len() > 1000 {
+            return Err("allowed_invite_codes capped at 1000 entries".into());
+        }
+        if self.allowed_guild_ids.len() > 1000 {
+            return Err("allowed_guild_ids capped at 1000 entries".into());
+        }
         for u in &self.user_thresholds {
             if !(1..=20).contains(&u.threshold) {
                 return Err("per-user threshold must be between 1 and 20".into());
@@ -171,6 +199,24 @@ impl LinkFilterConfig {
         self.exempt_user_channels
             .iter()
             .any(|e| e.user_id == user_id && e.channel_id == channel_id)
+    }
+
+    /// True when invite `code` is on the fast-path allowlist (case-sensitive — a
+    /// Discord invite code is case-sensitive). Lets the gateway skip a network
+    /// resolution for the common case (the Airforce vanity + curated partners).
+    pub fn is_invite_code_allowed(&self, code: &str) -> bool {
+        self.allowed_invite_codes.iter().any(|c| c == code)
+    }
+
+    /// True when an invite that resolves to `guild_id` is permitted: it is the
+    /// filter's own guild (`self.guild_id`, the server the bot moderates) or an
+    /// admin-listed partner in `allowed_guild_ids`. So invites to THIS server
+    /// always pass with no extra config; everything else is advertising.
+    pub fn is_guild_allowed(&self, guild_id: &str) -> bool {
+        if guild_id.is_empty() {
+            return false;
+        }
+        guild_id == self.guild_id || self.allowed_guild_ids.iter().any(|g| g == guild_id)
     }
 }
 
@@ -273,6 +319,42 @@ pub fn offending_hosts(text: &str, whitelist: &[String]) -> Vec<String> {
         .into_iter()
         .filter(|h| !host_is_whitelisted(h, whitelist))
         .collect()
+}
+
+// ── Discord invite detection ──────────────────────────────────────────────
+
+static INVITE_RE: Lazy<Regex> = Lazy::new(|| {
+    // optional scheme + optional www./ptb./canary. + a word boundary (so a
+    // look-alike host like `mydiscord.gg` is NOT matched) + either
+    // `discord.gg/CODE` or `discord(app).com/invite/CODE`. The match is
+    // case-insensitive but the captured CODE keeps its original case (invite
+    // codes are case-sensitive). Two capture groups — the code is whichever
+    // branch matched.
+    Regex::new(
+        r"(?i)(?:https?://)?(?:(?:www|ptb|canary)\.)?\b(?:discord\.gg/([A-Za-z0-9-]{1,64})|discord(?:app)?\.com/invite/([A-Za-z0-9-]{1,64}))",
+    )
+    .unwrap()
+});
+
+/// Distinct Discord **server-invite codes** mentioned in `text`. Recognises
+/// `discord.gg/CODE`, `discord.com/invite/CODE`, `discordapp.com/invite/CODE`
+/// (with or without a scheme / `www.` / `ptb.` / `canary.` — Discord renders the
+/// bare form as a clickable invite too). The invite CODE is case-sensitive so
+/// its original case is preserved. Order-preserving and de-duplicated.
+///
+/// Pure detection only — deciding which codes are allowed (the fast-path
+/// allowlist + guild resolution) is the gateway's job; see
+/// [`LinkFilterConfig::is_invite_code_allowed`] / [`LinkFilterConfig::is_guild_allowed`].
+pub fn extract_discord_invites(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for caps in INVITE_RE.captures_iter(text) {
+        if let Some(code) = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()) {
+            if !code.is_empty() && !out.iter().any(|c| c == code) {
+                out.push(code.to_string());
+            }
+        }
+    }
+    out
 }
 
 // ── Strike decay math ────────────────────────────────────────────────────
@@ -445,5 +527,89 @@ mod tests {
         let s = serde_json::to_string(&populated).unwrap();
         let back: LinkFilterConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(populated, back);
+    }
+
+    // ── Discord invite detection ──────────────────────────────────────────
+
+    #[test]
+    fn extracts_discord_invites_all_forms() {
+        let codes = extract_discord_invites(
+            "join https://discord.gg/AbCdEf and discord.com/invite/xyz123 plus \
+             www.discordapp.com/invite/Foo-Bar and bare discord.gg/airforce",
+        );
+        assert!(codes.contains(&"AbCdEf".to_string()), "{codes:?}");
+        assert!(codes.contains(&"xyz123".to_string()), "{codes:?}");
+        assert!(codes.contains(&"Foo-Bar".to_string()), "{codes:?}");
+        assert!(codes.contains(&"airforce".to_string()), "{codes:?}");
+    }
+
+    #[test]
+    fn invite_code_case_is_preserved() {
+        // Discord invite codes are case-sensitive — must NOT be lowercased.
+        assert_eq!(extract_discord_invites("discord.gg/HeLLo"), vec!["HeLLo".to_string()]);
+    }
+
+    #[test]
+    fn invite_extraction_dedups_and_orders() {
+        let codes = extract_discord_invites("discord.gg/a then discord.gg/a then discord.gg/b");
+        assert_eq!(codes, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn ptb_and_canary_invites_match() {
+        assert_eq!(extract_discord_invites("ptb.discord.com/invite/zzz"), vec!["zzz".to_string()]);
+        assert_eq!(extract_discord_invites("canary.discord.com/invite/qqq"), vec!["qqq".to_string()]);
+    }
+
+    #[test]
+    fn non_invites_and_lookalikes_are_ignored() {
+        // channel link, not an invite
+        assert!(extract_discord_invites("discord.com/channels/123/456").is_empty());
+        // look-alike hosts must NOT match (word-boundary guard)
+        assert!(extract_discord_invites("mydiscord.gg/scam").is_empty());
+        assert!(extract_discord_invites("notreallydiscord.com/invite/scam").is_empty());
+        // discord.com without /invite/ is not an invite
+        assert!(extract_discord_invites("discord.com/blog/x").is_empty());
+    }
+
+    #[test]
+    fn invite_trailing_punctuation_stops_the_code() {
+        assert_eq!(extract_discord_invites("come to discord.gg/abc!"), vec!["abc".to_string()]);
+        assert_eq!(extract_discord_invites("discord.gg/abc?ref=1"), vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn invite_code_allowlist_is_case_sensitive() {
+        let cfg = LinkFilterConfig {
+            allowed_invite_codes: vec!["airforce".into(), "Partner1".into()],
+            ..Default::default()
+        };
+        assert!(cfg.is_invite_code_allowed("airforce"));
+        assert!(cfg.is_invite_code_allowed("Partner1"));
+        assert!(!cfg.is_invite_code_allowed("AirForce")); // case-sensitive
+        assert!(!cfg.is_invite_code_allowed("other"));
+    }
+
+    #[test]
+    fn guild_allowlist_covers_own_guild_and_partners() {
+        let cfg = LinkFilterConfig {
+            guild_id: "111".into(),                // the bot's own (Airforce) guild
+            allowed_guild_ids: vec!["222".into()], // a curated partner server
+            ..Default::default()
+        };
+        assert!(cfg.is_guild_allowed("111")); // own guild always allowed
+        assert!(cfg.is_guild_allowed("222")); // listed partner
+        assert!(!cfg.is_guild_allowed("333")); // any other server = advertising
+        assert!(!cfg.is_guild_allowed("")); // empty = not allowed
+    }
+
+    #[test]
+    fn legacy_config_loads_without_invite_fields() {
+        // A blob written before the invite fields existed must still deserialize.
+        let legacy = r#"{"enabled":true,"guild_id":"1","strike_threshold":3}"#;
+        let cfg: LinkFilterConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!cfg.filter_invites);
+        assert!(cfg.allowed_invite_codes.is_empty());
+        assert!(cfg.allowed_guild_ids.is_empty());
     }
 }
