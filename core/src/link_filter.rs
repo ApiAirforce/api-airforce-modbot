@@ -323,32 +323,63 @@ pub fn offending_hosts(text: &str, whitelist: &[String]) -> Vec<String> {
 
 // ── Discord invite detection ──────────────────────────────────────────────
 
-static INVITE_RE: Lazy<Regex> = Lazy::new(|| {
-    // optional scheme + optional www./ptb./canary. + a word boundary (so a
-    // look-alike host like `mydiscord.gg` is NOT matched) + either
-    // `discord.gg/CODE` or `discord(app).com/invite/CODE`. The match is
-    // case-insensitive but the captured CODE keeps its original case (invite
-    // codes are case-sensitive). Two capture groups — the code is whichever
-    // branch matched.
-    Regex::new(
-        r"(?i)(?:https?://)?(?:(?:www|ptb|canary)\.)?\b(?:discord\.gg/([A-Za-z0-9-]{1,64})|discord(?:app)?\.com/invite/([A-Za-z0-9-]{1,64}))",
-    )
-    .unwrap()
-});
+// The invite CODE captured from the *path* of a confirmed Discord invite host.
+// The host itself is validated separately (it must actually BE discord.gg /
+// discord(app).com, see below) so a `discord.gg/CODE` substring buried in some
+// other URL's path or query is never extracted.
+static GG_PATH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^/([A-Za-z0-9-]{1,64})").unwrap());
+static INVITE_PATH_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^/invite/([A-Za-z0-9-]{1,64})").unwrap());
+
+/// `discord.gg` (the apex, where the path is `/CODE`) or any of its subdomains
+/// (`www.`/`ptb.`/`canary.` …; the whole `.gg` zone is Discord's). A look-alike
+/// apex such as `mydiscord.gg` does NOT end with `.discord.gg`, so it's rejected.
+fn is_discord_gg_host(host: &str) -> bool {
+    host == "discord.gg" || host.ends_with(".discord.gg")
+}
+
+/// `discord.com` / `discordapp.com` (or a subdomain), where an invite path is
+/// `/invite/CODE`.
+fn is_discord_com_host(host: &str) -> bool {
+    host == "discord.com"
+        || host == "discordapp.com"
+        || host.ends_with(".discord.com")
+        || host.ends_with(".discordapp.com")
+}
 
 /// Distinct Discord **server-invite codes** mentioned in `text`. Recognises
 /// `discord.gg/CODE`, `discord.com/invite/CODE`, `discordapp.com/invite/CODE`
-/// (with or without a scheme / `www.` / `ptb.` / `canary.` — Discord renders the
-/// bare form as a clickable invite too). The invite CODE is case-sensitive so
-/// its original case is preserved. Order-preserving and de-duplicated.
+/// (with or without a scheme / a `www.`/`ptb.`/`canary.` or any other subdomain
+/// — Discord renders the bare form as a clickable invite too). The invite CODE
+/// is case-sensitive so its original case is preserved. Order-preserving and
+/// de-duplicated.
+///
+/// Detection is **host-anchored**: it reuses the domain filter's URL parser
+/// ([`URL_RE`]) and only treats `discord.gg` / `discord(app).com` as an invite
+/// when it is the URL's actual HOST. A `discord.gg/CODE` substring that is
+/// merely part of *another* host's path or query — a redirector, a link
+/// shortener, an image/preview URL, possibly even to a whitelisted host — is
+/// therefore NOT an invite and is ignored. A look-alike apex like
+/// `mydiscord.gg` is rejected too.
 ///
 /// Pure detection only — deciding which codes are allowed (the fast-path
 /// allowlist + guild resolution) is the gateway's job; see
 /// [`LinkFilterConfig::is_invite_code_allowed`] / [`LinkFilterConfig::is_guild_allowed`].
 pub fn extract_discord_invites(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for caps in INVITE_RE.captures_iter(text) {
-        if let Some(code) = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()) {
+    for caps in URL_RE.captures_iter(text) {
+        let host = normalize_host(&caps["host"]);
+        let path = caps.name("path").map(|m| m.as_str()).unwrap_or("");
+        let code = if is_discord_gg_host(&host) {
+            GG_PATH_RE.captures(path)
+        } else if is_discord_com_host(&host) {
+            INVITE_PATH_RE.captures(path)
+        } else {
+            None
+        }
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str());
+        if let Some(code) = code {
             if !code.is_empty() && !out.iter().any(|c| c == code) {
                 out.push(code.to_string());
             }
@@ -565,11 +596,36 @@ mod tests {
     fn non_invites_and_lookalikes_are_ignored() {
         // channel link, not an invite
         assert!(extract_discord_invites("discord.com/channels/123/456").is_empty());
-        // look-alike hosts must NOT match (word-boundary guard)
+        // look-alike hosts must NOT match (host-anchored, not substring)
         assert!(extract_discord_invites("mydiscord.gg/scam").is_empty());
         assert!(extract_discord_invites("notreallydiscord.com/invite/scam").is_empty());
         // discord.com without /invite/ is not an invite
         assert!(extract_discord_invites("discord.com/blog/x").is_empty());
+    }
+
+    #[test]
+    fn invite_code_buried_in_foreign_url_is_not_an_invite() {
+        // The whole point of host-anchoring: a `discord.gg/CODE` substring that
+        // lives in the path/query of a DIFFERENT (often whitelisted) host is not
+        // a Discord invite and must never be resolved/struck.
+        for carrier in [
+            "https://example.com/redirect?to=discord.gg/abc",
+            "https://t.co/discord.gg/x",
+            "youtube.com/watch?v=discord.gg/foo",
+            "https://safelink.io/discord.gg/legit",
+            "![alt](https://cdn.site/discord.gg/abc)",
+            "google.com/search?q=discord.gg/abc",
+        ] {
+            assert!(
+                extract_discord_invites(carrier).is_empty(),
+                "buried code wrongly extracted from {carrier:?}",
+            );
+        }
+        // …but a genuine invite that merely co-occurs with a foreign link still counts.
+        assert_eq!(
+            extract_discord_invites("see example.com and then join discord.gg/realinvite"),
+            vec!["realinvite".to_string()],
+        );
     }
 
     #[test]

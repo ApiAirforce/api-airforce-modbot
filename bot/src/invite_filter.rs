@@ -17,6 +17,17 @@ use airforce_modbot_core::LinkFilterConfig;
 /// invite endpoint's rate limit happy when the same code is posted repeatedly.
 const CACHE_TTL: Duration = Duration::from_secs(3600);
 
+/// Soft cap on cached verdicts. When exceeded, expired entries are swept before
+/// inserting, so the map stays proportional to distinct codes seen within one
+/// TTL window rather than growing without bound (a spammer can otherwise post
+/// unlimited unique codes — one permanent entry each).
+const CACHE_CAP: usize = 10_000;
+
+/// Most network invite-resolutions performed for a single message. One
+/// non-allowlisted invite already triggers deletion, so we never need to
+/// resolve every code; this bounds the Discord-API fan-out a message can cause.
+const MAX_LOOKUPS_PER_MSG: usize = 5;
+
 /// Resolve-cache: invite code → (allowed, cached_at). A plain mutex-guarded map;
 /// the lock is never held across the `.await` below.
 #[derive(Default)]
@@ -35,6 +46,9 @@ impl InviteCache {
 
     fn store(&self, code: &str, allowed: bool) {
         if let Ok(mut map) = self.map.lock() {
+            if map.len() >= CACHE_CAP {
+                map.retain(|_, (_, at)| at.elapsed() < CACHE_TTL);
+            }
             map.insert(code.to_string(), (allowed, Instant::now()));
         }
     }
@@ -54,6 +68,7 @@ pub async fn first_offending_invite(
     cfg: &LinkFilterConfig,
     cache: &InviteCache,
 ) -> Option<String> {
+    let mut lookups = 0usize;
     for code in extract_discord_invites(text) {
         // Fast path: an explicitly allowlisted code never needs a lookup.
         if cfg.is_invite_code_allowed(&code) {
@@ -66,6 +81,13 @@ pub async fn first_offending_invite(
             }
             return Some(code);
         }
+        // Bound the per-message Discord-API fan-out: a single non-allowlisted
+        // invite already triggers deletion, so we never need to resolve every
+        // code — stop after a few uncached lookups.
+        if lookups >= MAX_LOOKUPS_PER_MSG {
+            break;
+        }
+        lookups += 1;
         // Resolve the code to its guild (no member counts / expiration needed).
         match ctx.http.get_invite(&code, false, false, None).await {
             Ok(invite) => {
