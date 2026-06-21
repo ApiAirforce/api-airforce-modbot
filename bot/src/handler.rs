@@ -27,6 +27,8 @@ pub struct Handler {
     /// Guards the expiry-sweep task so a gateway reconnect (another `ready`)
     /// doesn't spawn a second one.
     sweep_started: AtomicBool,
+    /// Resolve-cache for the Discord-invite sub-filter (code → allowed verdict).
+    invite_cache: crate::invite_filter::InviteCache,
 }
 
 impl Handler {
@@ -35,6 +37,7 @@ impl Handler {
             store,
             config,
             sweep_started: AtomicBool::new(false),
+            invite_cache: crate::invite_filter::InviteCache::default(),
         }
     }
 }
@@ -206,7 +209,15 @@ impl EventHandler for Handler {
 
         let threshold = cfg.threshold_for(&author_id);
         let offenders = offending_hosts(&message.content, &cfg.whitelist);
-        if offenders.is_empty() {
+        // The Discord-invite sub-filter is independent of the host whitelist: a
+        // server invite for any guild other than ours (or an allowlisted
+        // partner) is advertising too, even when discord.gg is whitelisted.
+        let offending_invite = if cfg.filter_invites {
+            crate::invite_filter::first_offending_invite(&ctx, &message.content, &cfg, &self.invite_cache).await
+        } else {
+            None
+        };
+        if offenders.is_empty() && offending_invite.is_none() {
             return;
         }
 
@@ -214,7 +225,15 @@ impl EventHandler for Handler {
         let _ = message.delete(&ctx.http).await;
 
         // 2) record the strike (atomic + decay-aware).
-        let reason = format!("ad link: {}", offenders.join(", "));
+        let reason = match offending_invite.as_deref() {
+            Some(code) if offenders.is_empty() => {
+                format!("ad: non-whitelisted Discord invite discord.gg/{code}")
+            }
+            Some(code) => {
+                format!("ad: links {} + Discord invite discord.gg/{code}", offenders.join(", "))
+            }
+            None => format!("ad link: {}", offenders.join(", ")),
+        };
         let new_count = self
             .store
             .record_link_strike(&author_id, &cfg.guild_id, &reason, Utc::now().timestamp(), cfg.decay_days)

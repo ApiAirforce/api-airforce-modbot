@@ -40,7 +40,8 @@ pub fn command_defs() -> Vec<CreateCommand> {
             .add_option(int("threshold", "Strikes before auto-jail (1-20)"))
             .add_option(int("decay_days", "Days of no violations after which strikes reset (0 = never)"))
             .add_option(role("jail_role", "Role to assign at the strike threshold"))
-            .add_option(boolean("warn_user", "DM the user a private strike notice")),
+            .add_option(boolean("warn_user", "DM the user a private strike notice"))
+            .add_option(boolean("filter_invites", "Also block Discord invites for OTHER servers (allowlist-gated)")),
         CreateCommand::new("whitelist")
             .description("Manage the domain whitelist (apex matches subdomains; use *.example.com for subdomains only)")
             .add_option(sub("add", "Whitelist a domain").add_sub_option(string("domain", "e.g. example.com or *.cdn.example.com").required(true)))
@@ -60,6 +61,16 @@ pub fn command_defs() -> Vec<CreateCommand> {
             .description("Set a per-user strike threshold (overrides the global one)")
             .add_option(user("user", "User").required(true))
             .add_option(int("threshold", "Their threshold (1-20), or 0 to remove the override").required(true)),
+        CreateCommand::new("allowinvite")
+            .description("Allow specific Discord invite codes (yours + partners); others are blocked when the invite filter is on")
+            .add_option(sub("add", "Allow a Discord invite code").add_sub_option(string("code", "The part after discord.gg/ , e.g. airforce").required(true)))
+            .add_option(sub("remove", "Remove an allowed invite code").add_sub_option(string("code", "Exact code to remove").required(true)))
+            .add_option(sub("list", "List allowed invite codes")),
+        CreateCommand::new("allowserver")
+            .description("Allow invites to specific partner servers by guild ID (your own server is always allowed)")
+            .add_option(sub("add", "Allow invites to a server").add_sub_option(string("guild_id", "The server (guild) ID").required(true)))
+            .add_option(sub("remove", "Remove an allowed server").add_sub_option(string("guild_id", "Guild ID to remove").required(true)))
+            .add_option(sub("list", "List allowed server IDs")),
         CreateCommand::new("strikes")
             .description("View or clear anti-ad strikes")
             .add_option(sub("list", "List recent strikes"))
@@ -167,6 +178,8 @@ pub async fn dispatch(ctx: &Context, cmd: &CommandInteraction, store: &RedbStore
         "exempt" => exempt(store, opts, true),
         "unexempt" => exempt(store, opts, false),
         "userlimit" => user_limit(store, opts),
+        "allowinvite" => allow_invite(store, opts),
+        "allowserver" => allow_server(store, opts),
         "strikes" => strikes(store, opts),
         "jail" => jail_cmd(ctx, store, cmd, opts).await,
         "unjail" => unjail_cmd(ctx, store, cmd, opts).await,
@@ -193,6 +206,7 @@ fn render_status(store: &RedbStore) -> String {
          • guild: `{}`\n• threshold: {} • decay: {} days • warn DM: {}\n\
          • whitelist: {} domains • exempt channels: {} • exempt roles: {}\n\
          • per-user channel exemptions: {} • per-user limits: {}\n\
+         • invite filter: {} • allowed invite codes: {} • partner servers: {}\n\
          • active strike records: {}\n\n\
          **Jail** — {}\n\
          • role: `{}` • channel: `{}` • default: {} min • DM: {}\n\
@@ -207,6 +221,9 @@ fn render_status(store: &RedbStore) -> String {
         f.exempt_role_ids.len(),
         f.exempt_user_channels.len(),
         f.user_thresholds.len(),
+        on_off(f.filter_invites),
+        f.allowed_invite_codes.len(),
+        f.allowed_guild_ids.len(),
         strikes,
         on_off(j.enabled),
         empty_dash(&j.jail_role_id),
@@ -239,6 +256,10 @@ fn set_filter(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, S
     if let Some(w) = get_bool(opts, "warn_user") {
         f.warn_user = w;
         changed.push(format!("warn_user = {w}"));
+    }
+    if let Some(b) = get_bool(opts, "filter_invites") {
+        f.filter_invites = b;
+        changed.push(format!("filter_invites = {b}"));
     }
     if changed.is_empty() {
         return Err("nothing to change — pass at least one option".into());
@@ -357,6 +378,82 @@ fn user_limit(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, S
     f.validate()?;
     f.save(store)?;
     Ok(format!("✅ <@{u}> will be jailed at {t} strikes"))
+}
+
+fn allow_invite(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+    let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
+    let mut f = LinkFilterConfig::load(store);
+    match sub {
+        "add" => {
+            let code = get_str(sopts, "code").ok_or("missing code")?.trim().to_string();
+            if code.is_empty() {
+                return Err("invalid code".into());
+            }
+            if f.allowed_invite_codes.iter().any(|c| c == &code) {
+                return Ok(format!("`{code}` is already allowed"));
+            }
+            f.allowed_invite_codes.push(code.clone());
+            f.validate()?;
+            f.save(store)?;
+            Ok(format!("✅ allowed invite code `{code}`"))
+        }
+        "remove" => {
+            let code = get_str(sopts, "code").ok_or("missing code")?.trim().to_string();
+            let before = f.allowed_invite_codes.len();
+            f.allowed_invite_codes.retain(|c| c != &code);
+            if f.allowed_invite_codes.len() == before {
+                return Ok(format!("`{code}` was not on the invite allowlist"));
+            }
+            f.save(store)?;
+            Ok(format!("✅ removed invite code `{code}`"))
+        }
+        "list" => {
+            if f.allowed_invite_codes.is_empty() {
+                Ok("the invite allowlist is empty (only your own server's invites pass)".into())
+            } else {
+                Ok(format!("**Allowed invite codes ({}):**\n{}", f.allowed_invite_codes.len(), f.allowed_invite_codes.join("\n")))
+            }
+        }
+        other => Err(format!("unknown subcommand {other}")),
+    }
+}
+
+fn allow_server(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+    let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
+    let mut f = LinkFilterConfig::load(store);
+    match sub {
+        "add" => {
+            let gid = get_str(sopts, "guild_id").ok_or("missing guild_id")?.trim().to_string();
+            if gid.parse::<u64>().is_err() {
+                return Err("guild_id must be a numeric server ID".into());
+            }
+            if f.allowed_guild_ids.iter().any(|g| g == &gid) {
+                return Ok(format!("`{gid}` is already allowed"));
+            }
+            f.allowed_guild_ids.push(gid.clone());
+            f.validate()?;
+            f.save(store)?;
+            Ok(format!("✅ allowed invites to server `{gid}`"))
+        }
+        "remove" => {
+            let gid = get_str(sopts, "guild_id").ok_or("missing guild_id")?.trim().to_string();
+            let before = f.allowed_guild_ids.len();
+            f.allowed_guild_ids.retain(|g| g != &gid);
+            if f.allowed_guild_ids.len() == before {
+                return Ok(format!("`{gid}` was not on the server allowlist"));
+            }
+            f.save(store)?;
+            Ok(format!("✅ removed server `{gid}`"))
+        }
+        "list" => {
+            if f.allowed_guild_ids.is_empty() {
+                Ok("the server allowlist is empty (only your own server's invites pass)".into())
+            } else {
+                Ok(format!("**Allowed server IDs ({}):**\n{}", f.allowed_guild_ids.len(), f.allowed_guild_ids.join("\n")))
+            }
+        }
+        other => Err(format!("unknown subcommand {other}")),
+    }
 }
 
 fn strikes(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {

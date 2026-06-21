@@ -7,6 +7,7 @@
 mod commands;
 mod config;
 mod handler;
+mod invite_filter;
 mod jail;
 mod store;
 
