@@ -10,10 +10,12 @@
 //! This is the same Ports-&-Adapters core that runs inside api.airforce; lifting
 //! it into this standalone crate is what lets the bot be self-hosted by anyone.
 
+pub mod flood_filter;
 pub mod jail;
 pub mod link_filter;
 pub mod ports;
 
+pub use flood_filter::{FloodAction, FloodFilterConfig, FloodScope, FloodTracker, FloodVerdict};
 pub use jail::JailConfig;
 pub use link_filter::LinkFilterConfig;
 pub use ports::{ConfigStore, JailRecord, JailStore, LinkStrike, StrikeStore};

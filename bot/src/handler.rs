@@ -15,7 +15,10 @@ use serenity::all::{
 use serenity::async_trait;
 
 use airforce_modbot_core::link_filter::offending_hosts;
-use airforce_modbot_core::{JailConfig, JailStore, LinkFilterConfig, StrikeStore};
+use airforce_modbot_core::{
+    FloodAction, FloodFilterConfig, FloodTracker, JailConfig, JailStore, LinkFilterConfig,
+    StrikeStore,
+};
 
 use crate::config::BotConfig;
 use crate::store::RedbStore;
@@ -29,6 +32,9 @@ pub struct Handler {
     sweep_started: AtomicBool,
     /// Resolve-cache for the Discord-invite sub-filter (code → allowed verdict).
     invite_cache: crate::invite_filter::InviteCache,
+    /// Live per-user sliding window for the cross-channel flood filter. In
+    /// memory only (state, not config); locked solely for record/evaluate.
+    flood_tracker: std::sync::Mutex<FloodTracker>,
 }
 
 impl Handler {
@@ -38,6 +44,7 @@ impl Handler {
             config,
             sweep_started: AtomicBool::new(false),
             invite_cache: crate::invite_filter::InviteCache::default(),
+            flood_tracker: std::sync::Mutex::new(FloodTracker::new()),
         }
     }
 }
@@ -180,6 +187,11 @@ impl EventHandler for Handler {
         if message.author.bot {
             return;
         }
+        // Cross-channel flood / raid filter runs first (its own config + gates).
+        // If it acted on this message, we're done.
+        if self.flood_check(&ctx, &message).await {
+            return;
+        }
         let cfg = LinkFilterConfig::load(&*self.store);
         let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
             return;
@@ -291,5 +303,145 @@ impl EventHandler for Handler {
 impl Handler {
     fn store_has_jail(&self, uid: &str) -> bool {
         self.store.get_jail(uid).is_some()
+    }
+
+    /// Cross-channel flood / raid filter. Records every counting message into a
+    /// per-user sliding window; on a trip it bulk-deletes the burst across
+    /// channels, records a strike, and (by config) jails + DMs. Returns `true`
+    /// when it handled the message so the caller stops processing it.
+    async fn flood_check(&self, ctx: &Context, message: &Message) -> bool {
+        let cfg = FloodFilterConfig::load(&*self.store);
+        let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
+            return false;
+        };
+        if !cfg.enabled || cfg.guild_id.is_empty() || msg_guild != cfg.guild_id {
+            return false;
+        }
+        let channel_id = message.channel_id.get().to_string();
+        if cfg.exempt_channel_ids.iter().any(|c| c == &channel_id) {
+            return false;
+        }
+        let author_id = message.author.id.get().to_string();
+        let is_owner = self.config.is_owner(&author_id);
+        let has_exempt_role = message.member.as_ref().is_some_and(|m| {
+            m.roles
+                .iter()
+                .any(|r| cfg.exempt_role_ids.iter().any(|er| er == &r.get().to_string()))
+        });
+        if is_owner || has_exempt_role || cfg.is_user_channel_exempt(&author_id, &channel_id) {
+            return false;
+        }
+
+        // Only messages matching the configured scope count toward the window.
+        let has_attachment = !message.attachments.is_empty();
+        let has_link = {
+            let c = message.content.to_ascii_lowercase();
+            c.contains("http://") || c.contains("https://") || c.contains("discord.gg/")
+        };
+        if !cfg.message_counts(has_attachment, has_link) {
+            return false;
+        }
+
+        // Monotonic process clock (ms). Serenity's Timestamp is `time`-based; a
+        // steady local clock is all the sliding window needs.
+        let now_ms = {
+            static EPOCH: std::sync::LazyLock<std::time::Instant> =
+                std::sync::LazyLock::new(std::time::Instant::now);
+            EPOCH.elapsed().as_millis() as u64
+        };
+        let (ch_thr, ms_thr) = cfg.thresholds_for(&author_id);
+        // Hold the lock ONLY for record/evaluate — never across an await below.
+        let verdict = {
+            let mut tracker = self.flood_tracker.lock().unwrap();
+            tracker.record_and_check(
+                &author_id,
+                &channel_id,
+                &message.id.get().to_string(),
+                now_ms,
+                &cfg,
+                ch_thr,
+                ms_thr,
+            )
+        };
+        let Some(v) = verdict else {
+            return false;
+        };
+
+        // 1) bulk-delete the burst across channels.
+        let mut deleted = 0u32;
+        for (cid, mid) in &v.messages_to_delete {
+            if let (Ok(c), Ok(m)) = (cid.parse::<u64>(), mid.parse::<u64>()) {
+                if serenity::all::ChannelId::new(c)
+                    .delete_message(&ctx.http, serenity::all::MessageId::new(m))
+                    .await
+                    .is_ok()
+                {
+                    deleted += 1;
+                }
+            }
+        }
+        // 2) record a strike (decay-aware; reuses the link strike store).
+        let new_count = self
+            .store
+            .record_link_strike(&author_id, &cfg.guild_id, &v.reason, Utc::now().timestamp(), cfg.decay_days)
+            .unwrap_or(0);
+        println!(
+            "🌊 flood-filter: {} — removed {deleted} msg(s) from {author_id} (strike {new_count})",
+            v.reason
+        );
+
+        // 3) act per config. Jail is the default for raid floods.
+        let do_jail = matches!(cfg.action, FloodAction::Jail);
+        if do_jail {
+            if let Some(gid) = message.guild_id {
+                let jailed = jail::try_jail(
+                    ctx,
+                    &*self.store,
+                    gid,
+                    message.author.id,
+                    &v.reason,
+                    "flood-filter",
+                )
+                .await;
+                if !jailed && !cfg.jail_role_id.is_empty() {
+                    if let Ok(rid) = cfg.jail_role_id.parse::<u64>() {
+                        if let Err(e) = ctx
+                            .http
+                            .add_member_role(
+                                gid,
+                                message.author.id,
+                                RoleId::new(rid),
+                                Some("flood-filter: trip"),
+                            )
+                            .await
+                        {
+                            eprintln!(
+                                "❌ flood-filter: FAILED to add jail role {rid} to {author_id}: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // 4) DM notice.
+        if cfg.warn_user {
+            if let Ok(dm) = message.author.create_dm_channel(&ctx.http).await {
+                let _ = dm
+                    .say(
+                        &ctx.http,
+                        format!(
+                            "🌊 Your messages were removed for posting too fast across \
+                             channels.{}",
+                            if do_jail {
+                                " You have been restricted — contact a mod."
+                            } else {
+                                ""
+                            }
+                        ),
+                    )
+                    .await;
+            }
+        }
+        true
     }
 }

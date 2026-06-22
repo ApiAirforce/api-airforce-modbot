@@ -1,6 +1,6 @@
 # api-airforce-modbot
 
-A small, self-hostable **Discord moderation bot** focused on two things it does
+A small, self-hostable **Discord moderation bot** focused on three things it does
 well:
 
 - **Anti-advertising link filter** — deletes messages linking to non-whitelisted
@@ -8,6 +8,12 @@ well:
   auto-jails repeat offenders. The whitelist supports apex + wildcard (`*.`)
   matches; strikes decay on a configurable window; thresholds and exemptions are
   tunable down to an individual user or a single (user, channel) pair.
+- **Cross-channel flood / raid filter** — catches an account blasting the same
+  thing across many channels (or hammering one) in seconds: it bulk-deletes the
+  whole burst, strikes the author, and (by default) jails them immediately. Both
+  triggers — distinct-channels-per-window and messages-per-window — plus the
+  action (warn / delete / jail), which messages count (all / attachments / links),
+  and per-user/role/channel exemptions are all tunable at runtime.
 - **A "real" jail** — instead of just adding a muted role, it **snapshots** the
   member's roles, **strips** them, and **restores** them on release. The jail
   survives bot restarts and is **escape-proof**: leaving and rejoining the server
@@ -24,9 +30,12 @@ community Discord and is open source so anyone can run it.
   subdomains only), tolerant of pasted `https://`/`www.`/paths.
 - Strike counting with optional decay; per-user and per-(user, channel)
   exemptions; whole-channel and whole-role exemptions; per-user strike limits.
+- Cross-channel flood/raid detection with a per-user sliding window (in memory,
+  bounded to active posters), dual triggers, configurable action and scope, and
+  the same exemption/per-user-override surface as the link filter.
 - Escape-proof role-snapshot jail with timed or indefinite sentences and an
   automatic expiry sweep.
-- 10 admin slash commands, gated to bot owners or members with **Manage Server**.
+- 14 admin slash commands, gated to bot owners or members with **Manage Server**.
 - Single self-contained binary, an embedded [`redb`](https://github.com/cberner/redb)
   database (one file), and a tiny `config.toml`. No external services.
 
@@ -123,6 +132,14 @@ That's it — non-whitelisted links now get removed and repeat offenders jailed.
 | `/jail` | Restrict a member (`user`, optional `minutes`, `reason`) |
 | `/unjail` | Release a member and restore their roles |
 | `/setjail` | Set `enabled`, `role`, `channel`, `default_minutes` |
+| `/setflood` | Configure the flood/raid filter: `enabled`, `channel_threshold`, `channel_window`, `msg_threshold`, `msg_window`, `action`, `scope`, `jail_role`, `decay_days`, `warn_user` (only what you pass) |
+| `/floodexempt channel\|role\|userchannel` | Add a flood-filter exemption |
+| `/floodunexempt channel\|role\|userchannel` | Remove a flood-filter exemption |
+| `/floodlimit` | Set per-user flood thresholds (`channel_threshold`, `msg_threshold`; 0 inherits) |
+
+The flood filter starts **disabled**; turn it on with e.g.
+`/setflood enabled:true channel_threshold:3 channel_window:10 action:jail` and it
+will quarantine accounts that post across 3+ channels within 10 seconds.
 
 ## How it works
 
