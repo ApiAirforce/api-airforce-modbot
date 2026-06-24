@@ -4,6 +4,7 @@
 //! gateway and runs the moderation event handler (anti-ad link filter +
 //! escape-proof jail + strikes). Runtime configuration is done via slash commands.
 
+mod ai;
 mod commands;
 mod config;
 mod handler;
@@ -14,6 +15,8 @@ mod store;
 use std::sync::Arc;
 
 use serenity::all::{Client, GatewayIntents};
+
+use ai::{AiClassifier, AirforceClassifier};
 
 use config::BotConfig;
 use handler::Handler;
@@ -59,7 +62,17 @@ async fn main() {
         | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let handler = Handler::new(store, Arc::new(cfg));
+    // AI moderation is wired only when an api.airforce key is present in the
+    // environment (AIRFORCE_API_KEY); otherwise it stays off and never spends.
+    let ai: Option<Arc<dyn AiClassifier>> = match AirforceClassifier::from_env() {
+        Some(c) => {
+            println!("🤖 AI moderation available (api.airforce); enable per-guild with /setai");
+            Some(Arc::new(c))
+        }
+        None => None,
+    };
+
+    let handler = Handler::new(store, Arc::new(cfg), ai);
     let mut client = match Client::builder(&token, intents).event_handler(handler).await {
         Ok(c) => c,
         Err(e) => {

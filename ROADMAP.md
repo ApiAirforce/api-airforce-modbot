@@ -46,7 +46,7 @@
 | **02** | [Content Automod](docs/plans/02-content-automod.md) | No word/regex/caps/mention/zalgo/dup filters | ~3–4 d | ◐ code+review done; staging-verify pending |
 | **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ◐ code+review done (4 findings fixed); staging-verify pending |
 | **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ◐ code+review done (1 low fixed); staging-verify pending |
-| **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ☐ later |
+| **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ◐ P1–3 code+review done (1 low fixed; mock-tested, no spend); live staging pending |
 | **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ☐ later |
 | **90** | [Community Breadth (backlog)](docs/plans/90-backlog-community.md) | Leveling/reaction-roles/welcome/tickets/… | ~10–14 d | ⏸ backlog |
 
@@ -207,3 +207,37 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
   ints — left for parity with the existing 8 int options that also rely on
   `validate()`.) **bot 11 + core 74 still green**, clippy zero new. Pending:
   staging test.
+- *2026-06-24* — **Plan 04 committed** (`94c897b`, explicit paths, no AI
+  attribution).
+- *2026-06-24* — **Plan 05 (AI moderation), Phases 1–3 code-complete
+  (mock-tested, NO real spend).** anes-Entscheidungen: sensible Defaults
+  (base URL + Key via env, **Modell + Policy pro Guild** via `/setai`), Scope =
+  mock-getestet. (1) New pure `core/ai_mod.rs` (no new core deps → backend stays
+  clean): `AiModConfig` (model/policy/action/confidence + Kostenwächter
+  min_chars/max_chars/daily_call_cap), `AiVerdict` + `allow()` (fail-open),
+  `should_classify`/`within_budget`/`action_for`/`truncate_for_call`; `validate`
+  erzwingt Modell + cap>0 wenn enabled. (2) `bot/ai.rs`: `AiClassifier`-Trait +
+  `AirforceClassifier` (reqwest chat/completions, **fail-open** auf jeden Fehler),
+  pure `build_request_body`/`parse_verdict` (robust gg fences/prose/garbage), gg
+  Fake-Classifier getestet. (3) Persisted Tagesbudget (`ai_calls_today`/`incr`,
+  EIN self-resetting Row pro Guild — kein Key-Growth). (4) handler: automod-Tail
+  in shared `apply_content_action` extrahiert (byte-identisch für automod) → AI
+  speist denselben Pfad; `ai_check` (Exemptions → Pre-Filter → Budget → classify
+  → action_for). `/setai` + `/aiexempt`/`/aiunexempt`, `/modstatus` zeigt AI +
+  Tages-Calls. **36 commands. bot 18 + core 80 green** (+7 bot, +6 core tests),
+  clippy still the 5 pre-existing warnings (zero new). Pending: Plan 05 review +
+  live staging (echter Spend, mit anes).
+- *2026-06-24* — **Plan 05 adversarial review (2 lenses + synthesis) → mergebar,
+  0 blocker.** Verified: the automod refactor is **byte-identical** (the shared
+  `apply_content_action` with `tag="automod"` reproduces `automod [rule]: reason`
+  + every audit/DM/case string → no regression); core stayed dependency-clean
+  (empty `core/Cargo.toml` diff → backend untouched); fail-open on every classify
+  error path; **no key leak** (key only in `bearer_auth`, never logged); cost
+  guards + exemptions run before any spend; budget row self-resets (no key
+  growth). **1 low fixed**: the daily cap was a soft cap under concurrency
+  (`within_budget` read + `incr` were 2 txns) → replaced with an atomic
+  `try_incr_ai_calls_today(cap)` compare-and-increment in ONE txn = a true hard
+  cap. (2nd low — a reserved slot isn't refunded when the call then fails open —
+  kept by design: counting attempts also circuit-breaks a sustained outage;
+  documented in `ai_check`.) **bot 18 + core 80 still green**, clippy zero new.
+  Pending: live staging (real api.airforce call, with anes).

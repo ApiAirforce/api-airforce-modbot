@@ -50,9 +50,16 @@ community Discord and is open source so anyone can run it.
   join-velocity **auto-lockdown**, and **anti-nuke** — a rogue or compromised
   admin mass-deleting channels/roles or mass-banning gets their roles stripped +
   an alert (with a **dry-run** mode and a trusted-actor allowlist).
+- Optional **AI moderation** (off by default): an LLM judges context the rules
+  can't (subtle toxicity, scams, multilingual abuse) over an
+  [api.airforce](https://api.airforce) account, feeding the same
+  warn/delete/timeout/jail path. Each server picks its own model + policy prompt;
+  hard cost guards (a cheap length pre-filter + a per-server **daily call cap**)
+  and **fail-open** behaviour (a down or over-budget classifier never blocks
+  chat) keep it safe. Enabling it sends message text to the configured endpoint.
 - Multi-guild: one instance moderates many servers, each with fully isolated
   config, strikes, jails, and cases.
-- 33 admin slash commands, gated to bot owners or members with **Manage Server**.
+- 36 admin slash commands, gated to bot owners or members with **Manage Server**.
 - Single self-contained binary, an embedded [`redb`](https://github.com/cberner/redb)
   database (one file), and a tiny `config.toml`. No external services.
 
@@ -138,6 +145,31 @@ The filter and jail start **disabled**. Configure them with slash commands
 
 That's it — non-whitelisted links now get removed and repeat offenders jailed.
 
+### 7. (Optional) AI moderation
+
+AI moderation is **off** until you both provide an API key and enable it per
+guild. Set an [api.airforce](https://api.airforce) key in the environment
+(`AIRFORCE_BASE_URL` is optional, defaults to api.airforce):
+
+```sh
+export AIRFORCE_API_KEY=your-api-airforce-key
+# optional: export AIRFORCE_BASE_URL=https://api.airforce/v1
+```
+
+Then enable it for a server, choosing the model and (optionally) a policy prompt:
+
+```text
+/setai enabled:true model:claude-haiku-4-5 action:delete confidence:80 daily_cap:500
+/setai policy:"No scams, no harassment, no NSFW. Allow normal banter and profanity."
+```
+
+> **Privacy + cost:** while enabled, the text of each checked message is sent to
+> the configured endpoint, and every call spends credit on **your** api.airforce
+> account. The cheap length pre-filter (`min_chars`) and the per-server
+> `daily_cap` bound the spend; if the API is down or the cap is reached the bot
+> **fails open** (it never blocks chat). Exempt channels/roles/users with
+> `/aiexempt`.
+
 ## Commands
 
 | Command | What it does |
@@ -172,6 +204,8 @@ That's it — non-whitelisted links now get removed and repeat offenders jailed.
 | `/lockdown` on\|off | Engage or lift a raid lockdown |
 | `/setantinuke` | Configure anti-nuke (mass-action protection; has a dry-run mode) |
 | `/raidtrust` add\|remove\|list | Manage anti-nuke trusted actors |
+| `/setai` | Configure AI moderation: `enabled`, `model`, `policy`, `action`, `confidence`, `timeout_minutes`, `min_chars`, `max_chars`, `daily_cap`, `warn_user` |
+| `/aiexempt` \| `/aiunexempt` | Add/remove an AI-moderation exemption (channel/role/user-channel) |
 
 The flood filter starts **disabled**; turn it on with e.g.
 `/setflood enabled:true channel_threshold:3 channel_window:10 action:jail` and it

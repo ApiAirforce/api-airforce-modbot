@@ -300,6 +300,58 @@ impl RedbStore {
         self.del_key(CONFIG, &Self::flood_trip_key(guild_id, user_id))
     }
 
+    // ── AI-moderation daily call budget (per guild, self-resetting) ───────────
+    // ONE CONFIG row per guild holds "{utc_day}:{count}". Reading on a new day
+    // reports 0; incrementing on a new day resets to 1. One row per guild (no
+    // per-day key growth), atomic RMW so concurrent messages can't lose a count.
+
+    fn ai_usage_key(guild_id: &str) -> String {
+        format!("ai_usage:{guild_id}")
+    }
+
+    /// Classifier calls already made for this guild on UTC day `today`
+    /// (`"YYYYMMDD"`). `0` once the day rolls over.
+    pub fn ai_calls_today(&self, guild_id: &str, today: &str) -> u32 {
+        self.get_str(CONFIG, &Self::ai_usage_key(guild_id))
+            .and_then(|s| {
+                let (day, count) = s.split_once(':')?;
+                if day == today { count.parse().ok() } else { Some(0) }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Atomically reserve one classifier call for this guild on `today` **iff**
+    /// the count is still under `cap`. Returns the new count on success, or `None`
+    /// when the cap is already reached (or on a store error — the caller then
+    /// skips the call, which is the safe direction). The compare and the increment
+    /// happen in ONE write transaction, so this is a true **hard** cap: concurrent
+    /// messages can't overshoot it. Resets to 1 when the stored day differs.
+    pub fn try_incr_ai_calls_today(&self, guild_id: &str, today: &str, cap: u32) -> Option<u32> {
+        let w = self.db.begin_write().ok()?;
+        let result;
+        {
+            let key = Self::ai_usage_key(guild_id);
+            let mut t = w.open_table(CONFIG).ok()?;
+            let prev = t
+                .get(key.as_str())
+                .ok()?
+                .and_then(|v| {
+                    let (day, count) = v.value().split_once(':')?;
+                    if day == today { count.parse::<u32>().ok() } else { Some(0) }
+                })
+                .unwrap_or(0);
+            if prev >= cap {
+                result = None;
+            } else {
+                let n = prev.saturating_add(1);
+                t.insert(key.as_str(), format!("{today}:{n}").as_str()).ok()?;
+                result = Some(n);
+            }
+        }
+        w.commit().ok()?;
+        result
+    }
+
     // ── cases (mod-log / case system) ────────────────────────────────────────
 
     /// Record a moderation case, assigning the next **per-guild** case number
@@ -678,6 +730,26 @@ mod tests {
         s.clear_flood_trip_in("g1", "u").unwrap();
         assert!(s.recent_flood_trip_in("g1", "u").is_none());
         s.clear_flood_trip_in("g1", "u").unwrap();
+    }
+
+    #[test]
+    fn ai_call_budget_is_a_hard_cap_and_resets_per_day() {
+        let ts = TempStore::new("aibudget");
+        let s = &ts.store;
+        assert_eq!(s.ai_calls_today("g1", "20260624"), 0);
+        // reserve up to the cap of 3
+        assert_eq!(s.try_incr_ai_calls_today("g1", "20260624", 3), Some(1));
+        assert_eq!(s.try_incr_ai_calls_today("g1", "20260624", 3), Some(2));
+        assert_eq!(s.try_incr_ai_calls_today("g1", "20260624", 3), Some(3));
+        assert_eq!(s.ai_calls_today("g1", "20260624"), 3);
+        // at the cap => None, and the count does NOT climb past it (hard cap)
+        assert_eq!(s.try_incr_ai_calls_today("g1", "20260624", 3), None);
+        assert_eq!(s.ai_calls_today("g1", "20260624"), 3);
+        // a new UTC day resets the count (read reports 0, next reserve starts at 1)
+        assert_eq!(s.ai_calls_today("g1", "20260625"), 0);
+        assert_eq!(s.try_incr_ai_calls_today("g1", "20260625", 3), Some(1));
+        // other guild is independent
+        assert_eq!(s.ai_calls_today("g2", "20260624"), 0);
     }
 
     #[test]

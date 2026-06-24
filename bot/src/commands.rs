@@ -16,9 +16,9 @@ use serenity::all::{
 use airforce_modbot_core::link_filter::{normalize_host, UserChannelExempt, UserThreshold};
 use airforce_modbot_core::flood_filter::FloodUserOverride;
 use airforce_modbot_core::{
-    AntinukeConfig, AutomodAction, AutomodConfig, CaseAction, EscalationAction, FloodAction,
-    FloodFilterConfig, FloodScope, GateAction, JailConfig, LinkFilterConfig, MatchMode, ModConfig,
-    RaidConfig,
+    AiModConfig, AntinukeConfig, AutomodAction, AutomodConfig, CaseAction, EscalationAction,
+    FloodAction, FloodFilterConfig, FloodScope, GateAction, JailConfig, LinkFilterConfig, MatchMode,
+    ModConfig, RaidConfig,
 };
 use chrono::Utc;
 
@@ -245,6 +245,34 @@ pub fn command_defs() -> Vec<CreateCommand> {
             .add_option(sub("add", "Trust an actor").add_sub_option(user("user", "User/bot to trust").required(true)))
             .add_option(sub("remove", "Untrust an actor").add_sub_option(user("user", "User to remove").required(true)))
             .add_option(sub("list", "List trusted actors")),
+        CreateCommand::new("setai")
+            .description("Configure AI moderation (LLM over the owner's api.airforce account; opt-in, costs credit)")
+            .add_option(boolean("enabled", "Turn AI moderation on or off"))
+            .add_option(string("model", "api.airforce model id to classify with (required to enable)"))
+            .add_option(string("policy", "Per-server policy prompt: what counts as a violation here"))
+            .add_option(
+                string("action", "What to do when a message is flagged")
+                    .add_string_choice("warn (delete + DM)", "warn")
+                    .add_string_choice("delete only", "delete")
+                    .add_string_choice("delete + timeout", "timeout")
+                    .add_string_choice("delete + jail", "jail"),
+            )
+            .add_option(int("confidence", "Only act at or above this confidence (0-100)"))
+            .add_option(int("timeout_minutes", "Timeout length when action = timeout (1-40320)"))
+            .add_option(int("min_chars", "Skip the API for messages shorter than this (cost guard)"))
+            .add_option(int("max_chars", "Truncate messages to this many chars before sending (1-8000)"))
+            .add_option(int("daily_cap", "Hard cap on classifier calls per day for this server (cost guard)"))
+            .add_option(boolean("warn_user", "DM the user when AI moderation acts")),
+        CreateCommand::new("aiexempt")
+            .description("Add an AI-moderation exemption")
+            .add_option(sub("channel", "Never AI-check a whole channel").add_sub_option(chan("channel", "Channel").required(true)))
+            .add_option(sub("role", "Never AI-check holders of a role").add_sub_option(role("role", "Role").required(true)))
+            .add_option(sub("userchannel", "Don't AI-check a user in ONE channel").add_sub_option(user("user", "User").required(true)).add_sub_option(chan("channel", "Channel").required(true))),
+        CreateCommand::new("aiunexempt")
+            .description("Remove an AI-moderation exemption")
+            .add_option(sub("channel", "Re-enable AI-checking in a channel").add_sub_option(chan("channel", "Channel").required(true)))
+            .add_option(sub("role", "Re-enable AI-checking for a role").add_sub_option(role("role", "Role").required(true)))
+            .add_option(sub("userchannel", "Remove a per-(user, channel) exemption").add_sub_option(user("user", "User").required(true)).add_sub_option(chan("channel", "Channel").required(true))),
     ]
 }
 
@@ -372,6 +400,9 @@ pub async fn dispatch(ctx: &Context, cmd: &CommandInteraction, store: &RedbStore
         "lockdown" => lockdown(store, &guild, opts),
         "setantinuke" => set_antinuke(store, &guild, opts),
         "raidtrust" => raid_trust(store, &guild, opts),
+        "setai" => set_ai(store, &guild, opts),
+        "aiexempt" => ai_exempt(store, &guild, opts, true),
+        "aiunexempt" => ai_exempt(store, &guild, opts, false),
         other => Err(format!("unknown command /{other}")),
     };
 
@@ -471,7 +502,7 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
     );
     let rd = RaidConfig::load_for_guild(store, guild);
     let an = AntinukeConfig::load_for_guild(store, guild);
-    format!(
+    let base = format!(
         "{base}\n\n**Raid protection** — {}\n\
          • gate: min age {}h • require avatar: {} → action {:?}\n\
          • join velocity: {} / {}s • lockdown: {}\n\n\
@@ -489,6 +520,27 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
         an.window_secs,
         an.dry_run,
         an.trusted_ids.len(),
+    );
+    let ai = AiModConfig::load_for_guild(store, guild);
+    let today = Utc::now().format("%Y%m%d").to_string();
+    let ai_used = store.ai_calls_today(guild, &today);
+    format!(
+        "{base}\n\n**AI moderation** — {}\n\
+         • model: `{}` • policy: {} • action: {:?} (≥{}% confidence)\n\
+         • pre-filter: ≥{} chars (truncate {} ) • budget: {}/{} calls today\n\
+         • exempt channels/roles/user-channels: {}/{}/{}",
+        on_off(ai.enabled),
+        empty_dash(&ai.model),
+        if ai.policy.trim().is_empty() { "default" } else { "custom" },
+        ai.action,
+        ai.confidence_threshold,
+        ai.min_chars,
+        ai.max_chars,
+        ai_used,
+        ai.daily_call_cap,
+        ai.exempt_channel_ids.len(),
+        ai.exempt_role_ids.len(),
+        ai.exempt_user_channels.len(),
     )
 }
 
@@ -1322,6 +1374,117 @@ fn automod_exempt(store: &RedbStore, guild: &str, opts: &[CommandDataOption], ad
             } else {
                 a.exempt_role_ids.retain(|x| x != &r);
                 "role re-enabled for automod"
+            }
+        }
+        "userchannel" => {
+            let u = get_user(sopts, "user").ok_or("missing user")?.get().to_string();
+            let c = get_channel(sopts, "channel").ok_or("missing channel")?.get().to_string();
+            if add {
+                if !a.exempt_user_channels.iter().any(|e| e.user_id == u && e.channel_id == c) {
+                    a.exempt_user_channels.push(UserChannelExempt { user_id: u, channel_id: c });
+                }
+                "user exempted in that channel"
+            } else {
+                a.exempt_user_channels.retain(|e| !(e.user_id == u && e.channel_id == c));
+                "per-(user, channel) exemption removed"
+            }
+        }
+        other => return Err(format!("unknown subcommand `{other}`")),
+    };
+    a.validate()?;
+    a.save_for_guild(store, guild)?;
+    Ok(format!("✅ {msg}"))
+}
+
+fn set_ai(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut a = AiModConfig::load_for_guild(store, guild);
+    let mut changed = Vec::new();
+    if let Some(b) = get_bool(opts, "enabled") {
+        a.enabled = b;
+        changed.push(format!("enabled = {b}"));
+    }
+    if let Some(m) = get_str(opts, "model") {
+        a.model = m.trim().to_string();
+        changed.push(format!("model = {}", if a.model.is_empty() { "(cleared)" } else { &a.model }));
+    }
+    if let Some(p) = get_str(opts, "policy") {
+        a.policy = p;
+        changed.push("policy updated".to_string());
+    }
+    if let Some(s) = get_str(opts, "action") {
+        a.action = match s.as_str() {
+            "warn" => AutomodAction::Warn,
+            "delete" => AutomodAction::Delete,
+            "timeout" => AutomodAction::Timeout,
+            "jail" => AutomodAction::Jail,
+            other => return Err(format!("invalid action `{other}`")),
+        };
+        changed.push(format!("action = {s}"));
+    }
+    if let Some(v) = get_int(opts, "confidence") {
+        a.confidence_threshold = v.clamp(0, 100) as u8;
+        changed.push(format!("confidence = {}", a.confidence_threshold));
+    }
+    if let Some(v) = get_int(opts, "timeout_minutes") {
+        a.timeout_minutes = v.clamp(1, 40_320) as u32;
+        changed.push(format!("timeout_minutes = {}", a.timeout_minutes));
+    }
+    if let Some(v) = get_int(opts, "min_chars") {
+        a.min_chars = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("min_chars = {}", a.min_chars));
+    }
+    if let Some(v) = get_int(opts, "max_chars") {
+        a.max_chars = v.clamp(1, 8000) as u32;
+        changed.push(format!("max_chars = {}", a.max_chars));
+    }
+    if let Some(v) = get_int(opts, "daily_cap") {
+        a.daily_call_cap = v.clamp(0, 1_000_000) as u32;
+        changed.push(format!("daily_cap = {}", a.daily_call_cap));
+    }
+    if let Some(b) = get_bool(opts, "warn_user") {
+        a.warn_user = b;
+        changed.push(format!("warn_user = {b}"));
+    }
+    if changed.is_empty() {
+        return Err("nothing to change — pass at least one option".into());
+    }
+    a.validate()?;
+    a.save_for_guild(store, guild)?;
+    let mut msg = format!("✅ AI moderation updated: {}", changed.join(", "));
+    if a.enabled {
+        msg.push_str(
+            "\n⚠️ AI moderation is **on** — each checked message spends api.airforce credit on the owner's account. The daily cap + pre-filter bound the cost; message text is sent to the configured endpoint.",
+        );
+    }
+    Ok(msg)
+}
+
+fn ai_exempt(store: &RedbStore, guild: &str, opts: &[CommandDataOption], add: bool) -> Result<String, String> {
+    let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
+    let mut a = AiModConfig::load_for_guild(store, guild);
+    let msg = match sub {
+        "channel" => {
+            let c = get_channel(sopts, "channel").ok_or("missing channel")?.get().to_string();
+            if add {
+                if !a.exempt_channel_ids.contains(&c) {
+                    a.exempt_channel_ids.push(c);
+                }
+                "channel exempted from AI moderation"
+            } else {
+                a.exempt_channel_ids.retain(|x| x != &c);
+                "channel re-enabled for AI moderation"
+            }
+        }
+        "role" => {
+            let r = get_role(sopts, "role").ok_or("missing role")?.get().to_string();
+            if add {
+                if !a.exempt_role_ids.contains(&r) {
+                    a.exempt_role_ids.push(r);
+                }
+                "role exempted from AI moderation"
+            } else {
+                a.exempt_role_ids.retain(|x| x != &r);
+                "role re-enabled for AI moderation"
             }
         }
         "userchannel" => {

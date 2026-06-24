@@ -17,12 +17,13 @@ use serenity::async_trait;
 
 use airforce_modbot_core::link_filter::offending_hosts;
 use airforce_modbot_core::{
-    ActionTracker, AntinukeConfig, AutomodAction, AutomodConfig, AutomodVerdict, CaseAction,
-    CompiledBlocklist, DestructiveAction, DuplicateTracker, FloodAction, FloodFilterConfig,
-    FloodTracker, GateAction, JailConfig, JailStore, JoinTracker, LinkFilterConfig, MatchMode,
-    ModConfig, RaidConfig,
+    ActionTracker, AiModConfig, AntinukeConfig, AutomodAction, AutomodConfig, AutomodVerdict,
+    CaseAction, CompiledBlocklist, DestructiveAction, DuplicateTracker, FloodAction,
+    FloodFilterConfig, FloodTracker, GateAction, JailConfig, JailStore, JoinTracker,
+    LinkFilterConfig, MatchMode, ModConfig, RaidConfig,
 };
 
+use crate::ai::AiClassifier;
 use crate::config::BotConfig;
 use crate::store::RedbStore;
 use crate::{commands, jail};
@@ -84,10 +85,13 @@ pub struct Handler {
     action_tracker: std::sync::Mutex<ActionTracker>,
     /// The bot's own user id (set on `ready`); anti-nuke never acts on it.
     bot_id: AtomicU64,
+    /// The AI-moderation classifier (an api.airforce adapter), or `None` when no
+    /// `AIRFORCE_API_KEY` is configured — then AI moderation is simply off.
+    ai: Option<Arc<dyn AiClassifier>>,
 }
 
 impl Handler {
-    pub fn new(store: Arc<RedbStore>, config: Arc<BotConfig>) -> Self {
+    pub fn new(store: Arc<RedbStore>, config: Arc<BotConfig>, ai: Option<Arc<dyn AiClassifier>>) -> Self {
         Self {
             store,
             config,
@@ -99,6 +103,7 @@ impl Handler {
             join_tracker: std::sync::Mutex::new(JoinTracker::new()),
             action_tracker: std::sync::Mutex::new(ActionTracker::new()),
             bot_id: AtomicU64::new(0),
+            ai,
         }
     }
 }
@@ -232,6 +237,10 @@ impl EventHandler for Handler {
         }
         // Content automod (blocklist/caps/mentions/emoji/zalgo/duplicate).
         if self.automod_check(&ctx, &message).await {
+            return;
+        }
+        // AI moderation (context-aware; opt-in, gated by pre-filter + budget).
+        if self.ai_check(&ctx, &message).await {
             return;
         }
         let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
@@ -602,17 +611,48 @@ impl Handler {
             return false;
         };
 
+        self.apply_content_action(
+            ctx, message, &msg_guild, cfg.action, cfg.timeout_minutes, cfg.warn_user, "automod",
+            "AutoMod", v.rule, &v.reason,
+        )
+        .await;
+        true
+    }
+
+    /// Apply a content-moderation outcome to a message: delete it, strike (per
+    /// action), apply the Discord action (timeout / jail), record a numbered case
+    /// with a mod-log entry, and DM the user. Shared by content automod and AI
+    /// moderation so both feed the **identical** action path. `tag` is the
+    /// lowercase label used in the strike reason / audit / DM (`"automod"` or
+    /// `"ai-mod"`); `mod_id` is the case author shown in the log (`"AutoMod"` or
+    /// `"AI-Mod"`); `rule` and `detail` describe what fired.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_content_action(
+        &self,
+        ctx: &Context,
+        message: &Message,
+        guild: &str,
+        action: AutomodAction,
+        timeout_minutes: u32,
+        warn_user: bool,
+        tag: &str,
+        mod_id: &str,
+        rule: &str,
+        detail: &str,
+    ) {
+        let author_id = message.author.id.get().to_string();
+
         // 1) delete the offending message.
         let _ = message.delete(&ctx.http).await;
 
         let now = Utc::now().timestamp();
-        let reason = format!("automod [{}]: {}", v.rule, v.reason);
-        let (case_action, duration_secs, strike) = match cfg.action {
+        let reason = format!("{tag} [{rule}]: {detail}");
+        let (case_action, duration_secs, strike) = match action {
             AutomodAction::Warn => (CaseAction::Warn, None, false),
             AutomodAction::Delete => (CaseAction::Warn, None, true),
             AutomodAction::Timeout => (
                 CaseAction::Timeout,
-                Some(cfg.timeout_minutes.clamp(1, 40_320) as u64 * 60),
+                Some(timeout_minutes.clamp(1, 40_320) as u64 * 60),
                 true,
             ),
             AutomodAction::Jail => (CaseAction::Jail, None, true),
@@ -620,14 +660,14 @@ impl Handler {
 
         // 2) strike (shared with the link/flood quarantine system).
         if strike {
-            let _ = self.store.record_link_strike_in(&msg_guild, &author_id, &reason, now, 0);
+            let _ = self.store.record_link_strike_in(guild, &author_id, &reason, now, 0);
         }
 
         // 3) apply the Discord action.
         if let Some(gid) = message.guild_id {
-            match cfg.action {
+            match action {
                 AutomodAction::Timeout => {
-                    let mins = cfg.timeout_minutes.clamp(1, 40_320);
+                    let mins = timeout_minutes.clamp(1, 40_320);
                     if let Ok(ts) = serenity::all::Timestamp::from_unix_timestamp(now + mins as i64 * 60) {
                         if let Err(e) = gid
                             .edit_member(
@@ -635,16 +675,16 @@ impl Handler {
                                 message.author.id,
                                 serenity::all::EditMember::new()
                                     .disable_communication_until_datetime(ts)
-                                    .audit_log_reason("automod"),
+                                    .audit_log_reason(tag),
                             )
                             .await
                         {
-                            eprintln!("❌ automod timeout failed for {author_id}: {e}");
+                            eprintln!("❌ {tag} timeout failed for {author_id}: {e}");
                         }
                     }
                 }
                 AutomodAction::Jail => {
-                    jail::try_jail(ctx, &self.store, gid, message.author.id, &reason, "automod").await;
+                    jail::try_jail(ctx, &self.store, gid, message.author.id, &reason, tag).await;
                 }
                 AutomodAction::Warn | AutomodAction::Delete => {}
             }
@@ -653,18 +693,87 @@ impl Handler {
         // 4) numbered case + mod-log embed.
         let id = self
             .store
-            .add_case(&msg_guild, &author_id, "AutoMod", case_action, &reason, now, duration_secs)
+            .add_case(guild, &author_id, mod_id, case_action, &reason, now, duration_secs)
             .unwrap_or(0);
-        commands::post_modlog(ctx, &self.store, &msg_guild, id, case_action, message.author.id, "AutoMod", &reason, duration_secs).await;
+        commands::post_modlog(ctx, &self.store, guild, id, case_action, message.author.id, mod_id, &reason, duration_secs).await;
 
         // 5) DM notice.
-        if cfg.warn_user {
+        if warn_user {
             if let Ok(dm) = message.author.create_dm_channel(&ctx.http).await {
                 let _ = dm
-                    .say(&ctx.http, format!("🛡️ Your message was removed by automod ({}).", v.rule))
+                    .say(&ctx.http, format!("🛡️ Your message was removed by {tag} ({rule})."))
                     .await;
             }
         }
+    }
+
+    /// AI moderation: when enabled + the message passes the cheap pre-filter,
+    /// exemptions, and the per-guild daily budget, classify it with the guild's
+    /// model + policy (over the owner's api.airforce account) and, if the verdict
+    /// is a confident flag, run it through the shared content-action path. Fails
+    /// open everywhere (a down/over-budget classifier never blocks chat). Returns
+    /// `true` when it acted on the message.
+    async fn ai_check(&self, ctx: &Context, message: &Message) -> bool {
+        let Some(classifier) = self.ai.as_ref() else {
+            return false;
+        };
+        let Some(guild) = message.guild_id.map(|g| g.get().to_string()) else {
+            return false;
+        };
+        let cfg = AiModConfig::load_for_guild(&*self.store, &guild);
+        if !cfg.enabled || cfg.model.trim().is_empty() {
+            return false;
+        }
+        // Same exemption surface as the other content filters.
+        let channel_id = message.channel_id.get().to_string();
+        if cfg.exempt_channel_ids.iter().any(|c| c == &channel_id) {
+            return false;
+        }
+        let author_id = message.author.id.get().to_string();
+        let has_exempt_role = message.member.as_ref().is_some_and(|m| {
+            m.roles
+                .iter()
+                .any(|r| cfg.exempt_role_ids.iter().any(|er| er == &r.get().to_string()))
+        });
+        if self.config.is_owner(&author_id)
+            || has_exempt_role
+            || cfg.is_user_channel_exempt(&author_id, &channel_id)
+        {
+            return false;
+        }
+        // Cost guard 1: cheap pre-filter (skip too-short messages).
+        if !cfg.should_classify(&message.content) {
+            return false;
+        }
+        // Cost guard 2: per-guild daily budget on the owner's account, enforced as
+        // a HARD cap via an atomic reserve (compare-and-increment in one txn, so
+        // concurrent messages can't overshoot). At the cap we fail open (stop
+        // calling), never block the message. A reserved slot is intentionally NOT
+        // refunded if the call then fails open: counting attempts also
+        // circuit-breaks a sustained api.airforce outage (stop after `cap` tries
+        // for the day) instead of retrying on every message, and the cap is a
+        // spend ceiling, not an exact success counter.
+        let today = Utc::now().format("%Y%m%d").to_string();
+        if self.store.try_incr_ai_calls_today(&guild, &today, cfg.daily_call_cap).is_none() {
+            return false;
+        }
+
+        // Classify (fails open internally) and act only on a confident flag.
+        let text = cfg.truncate_for_call(&message.content);
+        let verdict = classifier.classify(&text, &cfg.policy, &cfg.model).await;
+        let Some(action) = cfg.action_for(&verdict) else {
+            return false;
+        };
+        let detail = if verdict.reason.trim().is_empty() {
+            verdict.category.clone()
+        } else {
+            format!("{} — {}", verdict.category, verdict.reason)
+        };
+        self.apply_content_action(
+            ctx, message, &guild, action, cfg.timeout_minutes, cfg.warn_user, "ai-mod", "AI-Mod",
+            &verdict.category, &detail,
+        )
+        .await;
         true
     }
 

@@ -10,6 +10,7 @@
 //! This is the same Ports-&-Adapters core that runs inside api.airforce; lifting
 //! it into this standalone crate is what lets the bot be self-hosted by anyone.
 
+pub mod ai_mod;
 pub mod antinuke;
 pub mod automod;
 pub mod bulk_delete;
@@ -20,6 +21,7 @@ pub mod link_filter;
 pub mod ports;
 pub mod raid;
 
+pub use ai_mod::{AiModConfig, AiVerdict};
 pub use antinuke::{ActionTracker, AntinukeConfig, DestructiveAction};
 pub use automod::{
     AutomodAction, AutomodConfig, AutomodVerdict, CompiledBlocklist, DuplicateTracker, MatchMode,
@@ -104,6 +106,11 @@ mod guild_config_tests {
             .save_for_guild(&s, "111").unwrap();
         assert_eq!(ModConfig::load_for_guild(&s, "111").mod_log_channel_id, "999");
         assert_eq!(ModConfig::load_for_guild(&s, "222").mod_log_channel_id, ""); // default
+
+        ai_mod::AiModConfig { enabled: true, guild_id: "111".into(), model: "m".into(), ..Default::default() }
+            .save_for_guild(&s, "111").unwrap();
+        assert_eq!(ai_mod::AiModConfig::load_for_guild(&s, "111").model, "m");
+        assert_eq!(ai_mod::AiModConfig::load_for_guild(&s, "222").model, ""); // default
 
         // Per-guild writes never touch the legacy single-guild (bare-key) blob,
         // so the api.airforce backend's single-guild path stays untouched.
