@@ -16,8 +16,9 @@ use serenity::all::{
 use airforce_modbot_core::link_filter::{normalize_host, UserChannelExempt, UserThreshold};
 use airforce_modbot_core::flood_filter::FloodUserOverride;
 use airforce_modbot_core::{
-    AutomodAction, AutomodConfig, CaseAction, EscalationAction, FloodAction, FloodFilterConfig,
-    FloodScope, JailConfig, LinkFilterConfig, MatchMode, ModConfig,
+    AntinukeConfig, AutomodAction, AutomodConfig, CaseAction, EscalationAction, FloodAction,
+    FloodFilterConfig, FloodScope, GateAction, JailConfig, LinkFilterConfig, MatchMode, ModConfig,
+    RaidConfig,
 };
 use chrono::Utc;
 
@@ -214,6 +215,34 @@ pub fn command_defs() -> Vec<CreateCommand> {
             .add_option(sub("channel", "Re-enable automod in a channel").add_sub_option(chan("channel", "Channel").required(true)))
             .add_option(sub("role", "Re-enable automod for a role").add_sub_option(role("role", "Role").required(true)))
             .add_option(sub("userchannel", "Remove a per-(user, channel) exemption").add_sub_option(user("user", "User").required(true)).add_sub_option(chan("channel", "Channel").required(true))),
+        CreateCommand::new("setraid")
+            .description("Configure join-raid protection (only the options you pass change)")
+            .add_option(boolean("enabled", "Turn raid protection on or off"))
+            .add_option(int("min_account_age_hours", "Reject accounts younger than N hours (0 = off)"))
+            .add_option(boolean("require_avatar", "Reject members with no custom avatar"))
+            .add_option(
+                string("gate_action", "What to do to a member that fails the gate")
+                    .add_string_choice("quarantine (jail — reversible)", "quarantine")
+                    .add_string_choice("kick", "kick")
+                    .add_string_choice("ban", "ban"),
+            )
+            .add_option(int("join_threshold", "Auto-lockdown at N joins in the window (0 = off)"))
+            .add_option(int("join_window", "Join-velocity window in seconds (1-3600)")),
+        CreateCommand::new("lockdown")
+            .description("Engage or lift a raid lockdown (every join is met with the gate action)")
+            .add_option(sub("on", "Engage lockdown"))
+            .add_option(sub("off", "Lift lockdown")),
+        CreateCommand::new("setantinuke")
+            .description("Configure anti-nuke (rogue/compromised-admin mass-action protection)")
+            .add_option(boolean("enabled", "Turn anti-nuke on or off"))
+            .add_option(int("max_actions", "Trip at N destructive actions by one actor in the window (0 = off)"))
+            .add_option(int("window", "Anti-nuke window in seconds (1-3600)"))
+            .add_option(boolean("dry_run", "Alert only — do NOT strip roles (safe tuning mode)")),
+        CreateCommand::new("raidtrust")
+            .description("Manage anti-nuke trusted actors (never tripped)")
+            .add_option(sub("add", "Trust an actor").add_sub_option(user("user", "User/bot to trust").required(true)))
+            .add_option(sub("remove", "Untrust an actor").add_sub_option(user("user", "User to remove").required(true)))
+            .add_option(sub("list", "List trusted actors")),
     ]
 }
 
@@ -337,6 +366,10 @@ pub async fn dispatch(ctx: &Context, cmd: &CommandInteraction, store: &RedbStore
         "blocklist" => blocklist(store, &guild, opts),
         "automodexempt" => automod_exempt(store, &guild, opts, true),
         "automodunexempt" => automod_exempt(store, &guild, opts, false),
+        "setraid" => set_raid(store, &guild, opts),
+        "lockdown" => lockdown(store, &guild, opts),
+        "setantinuke" => set_antinuke(store, &guild, opts),
+        "raidtrust" => raid_trust(store, &guild, opts),
         other => Err(format!("unknown command /{other}")),
     };
 
@@ -413,7 +446,7 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
         fl.user_overrides.len(),
     );
     let am = AutomodConfig::load_for_guild(store, guild);
-    format!(
+    let base = format!(
         "{base}\n\n**Automod** — {}\n\
          • blocklist: {} terms ({:?}) • caps: {}% (min {} letters) • mentions: {} • emoji: {} • zalgo: {}%\n\
          • duplicate: {}/{}s • action: {:?} • exempt channels/roles/user-channels: {}/{}/{}",
@@ -431,6 +464,27 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
         am.exempt_channel_ids.len(),
         am.exempt_role_ids.len(),
         am.exempt_user_channels.len(),
+    );
+    let rd = RaidConfig::load_for_guild(store, guild);
+    let an = AntinukeConfig::load_for_guild(store, guild);
+    format!(
+        "{base}\n\n**Raid protection** — {}\n\
+         • gate: min age {}h • require avatar: {} → action {:?}\n\
+         • join velocity: {} / {}s • lockdown: {}\n\n\
+         **Anti-nuke** — {}\n\
+         • {} destructive actions / {}s • dry-run: {} • trusted actors: {}",
+        on_off(rd.enabled),
+        rd.min_account_age_hours,
+        rd.require_avatar,
+        rd.gate_action,
+        rd.join_threshold,
+        rd.join_window_secs,
+        on_off(rd.lockdown_active),
+        on_off(an.enabled),
+        an.max_actions,
+        an.window_secs,
+        an.dry_run,
+        an.trusted_ids.len(),
     )
 }
 
@@ -1272,6 +1326,133 @@ fn automod_exempt(store: &RedbStore, guild: &str, opts: &[CommandDataOption], ad
     a.validate()?;
     a.save_for_guild(store, guild)?;
     Ok(format!("✅ {msg}"))
+}
+
+fn set_raid(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut r = RaidConfig::load_for_guild(store, guild);
+    let mut changed = Vec::new();
+    if let Some(b) = get_bool(opts, "enabled") {
+        r.enabled = b;
+        changed.push(format!("enabled = {b}"));
+    }
+    if let Some(v) = get_int(opts, "min_account_age_hours") {
+        r.min_account_age_hours = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("min_account_age_hours = {}", r.min_account_age_hours));
+    }
+    if let Some(b) = get_bool(opts, "require_avatar") {
+        r.require_avatar = b;
+        changed.push(format!("require_avatar = {b}"));
+    }
+    if let Some(s) = get_str(opts, "gate_action") {
+        r.gate_action = match s.as_str() {
+            "quarantine" => GateAction::Quarantine,
+            "kick" => GateAction::Kick,
+            "ban" => GateAction::Ban,
+            other => return Err(format!("invalid gate_action `{other}`")),
+        };
+        changed.push(format!("gate_action = {s}"));
+    }
+    if let Some(v) = get_int(opts, "join_threshold") {
+        r.join_threshold = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("join_threshold = {}", r.join_threshold));
+    }
+    if let Some(v) = get_int(opts, "join_window") {
+        r.join_window_secs = v.clamp(1, 3600) as u32;
+        changed.push(format!("join_window = {}s", r.join_window_secs));
+    }
+    if changed.is_empty() {
+        return Err("nothing to change — pass at least one option".into());
+    }
+    r.validate()?;
+    r.save_for_guild(store, guild)?;
+    Ok(format!("✅ raid protection updated: {}", changed.join(", ")))
+}
+
+fn lockdown(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let (sub, _) = subcommand(opts).ok_or("missing on/off")?;
+    let mut r = RaidConfig::load_for_guild(store, guild);
+    match sub {
+        "on" => {
+            r.lockdown_active = true;
+            r.save_for_guild(store, guild)?;
+            Ok("🔒 lockdown engaged — every new join is now met with the gate action. Lift with `/lockdown off`.".into())
+        }
+        "off" => {
+            r.lockdown_active = false;
+            r.save_for_guild(store, guild)?;
+            Ok("🔓 lockdown lifted — joins are screened normally again.".into())
+        }
+        other => Err(format!("unknown subcommand `{other}` (use on/off)")),
+    }
+}
+
+fn set_antinuke(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut a = AntinukeConfig::load_for_guild(store, guild);
+    let mut changed = Vec::new();
+    if let Some(b) = get_bool(opts, "enabled") {
+        a.enabled = b;
+        changed.push(format!("enabled = {b}"));
+    }
+    if let Some(v) = get_int(opts, "max_actions") {
+        a.max_actions = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("max_actions = {}", a.max_actions));
+    }
+    if let Some(v) = get_int(opts, "window") {
+        a.window_secs = v.clamp(1, 3600) as u32;
+        changed.push(format!("window = {}s", a.window_secs));
+    }
+    if let Some(b) = get_bool(opts, "dry_run") {
+        a.dry_run = b;
+        changed.push(format!("dry_run = {b}"));
+    }
+    if changed.is_empty() {
+        return Err("nothing to change — pass at least one option".into());
+    }
+    a.validate()?;
+    a.save_for_guild(store, guild)?;
+    let mut msg = format!("✅ anti-nuke updated: {}", changed.join(", "));
+    if a.enabled && !a.dry_run {
+        msg.push_str(
+            "\n⚠️ Anti-nuke is **live** — it will strip roles when it trips. Run `/setantinuke dry_run:true` first to watch the alerts and tune `max_actions`/`window` before it acts.",
+        );
+    }
+    Ok(msg)
+}
+
+fn raid_trust(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
+    let mut a = AntinukeConfig::load_for_guild(store, guild);
+    match sub {
+        "add" => {
+            let u = get_user(sopts, "user").ok_or("missing user")?.get().to_string();
+            if a.trusted_ids.iter().any(|t| t == &u) {
+                return Ok(format!("<@{u}> is already trusted"));
+            }
+            a.trusted_ids.push(u.clone());
+            a.validate()?;
+            a.save_for_guild(store, guild)?;
+            Ok(format!("✅ <@{u}> is now trusted (never trips anti-nuke)"))
+        }
+        "remove" => {
+            let u = get_user(sopts, "user").ok_or("missing user")?.get().to_string();
+            let before = a.trusted_ids.len();
+            a.trusted_ids.retain(|t| t != &u);
+            if a.trusted_ids.len() == before {
+                return Ok(format!("<@{u}> was not on the trusted list"));
+            }
+            a.save_for_guild(store, guild)?;
+            Ok(format!("✅ removed <@{u}> from the trusted list"))
+        }
+        "list" => {
+            if a.trusted_ids.is_empty() {
+                Ok("no trusted actors (the owner + the bot are always exempt)".into())
+            } else {
+                let lines: Vec<String> = a.trusted_ids.iter().map(|t| format!("<@{t}>")).collect();
+                Ok(format!("**Trusted actors ({}):**\n{}", a.trusted_ids.len(), lines.join(", ")))
+            }
+        }
+        other => Err(format!("unknown subcommand {other}")),
+    }
 }
 
 /// "case #N", or a clear note when the action happened but the case could not be

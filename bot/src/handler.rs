@@ -4,26 +4,54 @@
 //! this in `commands.rs`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use serenity::all::{
-    Context, EventHandler, GuildId, GuildMemberUpdateEvent, Interaction, Member, Message, Ready,
-    RoleId, UserId,
+    AuditLogEntry, ChannelId, Context, EditMember, EventHandler, GuildId, GuildMemberUpdateEvent,
+    Interaction, Member, Message, Ready, RoleId, UserId,
 };
 use serenity::async_trait;
 
 use airforce_modbot_core::link_filter::offending_hosts;
 use airforce_modbot_core::{
-    AutomodAction, AutomodConfig, AutomodVerdict, CaseAction, CompiledBlocklist, DuplicateTracker,
-    FloodAction, FloodFilterConfig, FloodTracker, JailConfig, JailStore, LinkFilterConfig, MatchMode,
+    ActionTracker, AntinukeConfig, AutomodAction, AutomodConfig, AutomodVerdict, CaseAction,
+    CompiledBlocklist, DestructiveAction, DuplicateTracker, FloodAction, FloodFilterConfig,
+    FloodTracker, GateAction, JailConfig, JailStore, JoinTracker, LinkFilterConfig, MatchMode,
+    ModConfig, RaidConfig,
 };
 
 use crate::config::BotConfig;
 use crate::store::RedbStore;
 use crate::{commands, jail};
+
+/// Monotonic process clock in milliseconds, shared by the raid/anti-nuke
+/// trackers (a steady local clock is all the sliding windows need).
+fn monotonic_ms() -> u64 {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    EPOCH.elapsed().as_millis() as u64
+}
+
+/// Map a destructive audit-log action to the anti-nuke counter type (`None` =>
+/// not a tracked destructive action, so it is ignored).
+fn map_destructive(entry: &AuditLogEntry) -> Option<DestructiveAction> {
+    use serenity::model::guild::audit_log::{Action, ChannelAction, MemberAction, RoleAction};
+    // Only genuinely *destructive* privileged actions feed the burst counter.
+    // Webhook-create is intentionally NOT counted: it deletes nothing, and wiring
+    // up several logging/integration webhooks during normal server setup would
+    // otherwise trip anti-nuke and strip a real admin (webhook *spam* is a content
+    // problem the flood/automod filters handle, not a nuke).
+    match entry.action {
+        Action::Channel(ChannelAction::Delete) => Some(DestructiveAction::ChannelDelete),
+        Action::Role(RoleAction::Delete) => Some(DestructiveAction::RoleDelete),
+        Action::Member(MemberAction::BanAdd) => Some(DestructiveAction::Ban),
+        Action::Member(MemberAction::Kick) => Some(DestructiveAction::Kick),
+        _ => None,
+    }
+}
 
 /// Cached compiled blocklist for a guild + the config fields it was built from,
 /// so the (expensive) regex compilation runs only when an admin changes the
@@ -50,6 +78,12 @@ pub struct Handler {
     dup_tracker: std::sync::Mutex<DuplicateTracker>,
     /// Per-guild compiled-blocklist cache (rebuilt only when the config changes).
     automod_cache: std::sync::Mutex<HashMap<String, AutomodCacheEntry>>,
+    /// Per-guild join-velocity window (raid detection).
+    join_tracker: std::sync::Mutex<JoinTracker>,
+    /// Per-(guild,actor) destructive-action window (anti-nuke).
+    action_tracker: std::sync::Mutex<ActionTracker>,
+    /// The bot's own user id (set on `ready`); anti-nuke never acts on it.
+    bot_id: AtomicU64,
 }
 
 impl Handler {
@@ -62,6 +96,9 @@ impl Handler {
             flood_tracker: std::sync::Mutex::new(FloodTracker::new()),
             dup_tracker: std::sync::Mutex::new(DuplicateTracker::new()),
             automod_cache: std::sync::Mutex::new(HashMap::new()),
+            join_tracker: std::sync::Mutex::new(JoinTracker::new()),
+            action_tracker: std::sync::Mutex::new(ActionTracker::new()),
+            bot_id: AtomicU64::new(0),
         }
     }
 }
@@ -70,6 +107,7 @@ impl Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ connected as {} ({})", ready.user.name, ready.user.id);
+        self.bot_id.store(ready.user.id.get(), Ordering::Relaxed);
 
         // Register the admin slash commands. A `guild_id` in config.toml registers
         // to that one guild instantly (best for dev or a single server); leaving it
@@ -122,13 +160,15 @@ impl EventHandler for Handler {
     /// Re-apply the jail when a jailed user rejoins (escape-proofing). Needs the
     /// GUILD_MEMBERS privileged intent.
     async fn guild_member_addition(&self, ctx: Context, new_member: Member) {
-        jail::reapply_if_jailed(
-            &ctx,
-            &self.store,
-            new_member.guild_id,
-            new_member.user.id,
-        )
-        .await;
+        jail::reapply_if_jailed(&ctx, &self.store, new_member.guild_id, new_member.user.id).await;
+        self.raid_check(&ctx, &new_member).await;
+    }
+
+    /// Anti-nuke: watch the audit log for destructive privileged actions and, when
+    /// one actor crosses the threshold inside the window, strip their (non-managed)
+    /// roles + alert — or just alert, in dry-run. Needs VIEW_AUDIT_LOG.
+    async fn guild_audit_log_entry_create(&self, ctx: Context, entry: AuditLogEntry, guild_id: GuildId) {
+        self.antinuke_check(&ctx, entry, guild_id).await;
     }
 
     /// Manual jail-role watcher: a moderator hand-assigning the jail role runs
@@ -303,6 +343,189 @@ impl EventHandler for Handler {
 impl Handler {
     fn store_has_jail(&self, guild_id: &str, uid: &str) -> bool {
         self.store.get_jail_in(guild_id, uid).is_some()
+    }
+
+    /// Post a plain alert to the configured mod-log channel (no-op if unset).
+    async fn alert(&self, ctx: &Context, guild: &str, text: &str) {
+        let mc = ModConfig::load_for_guild(&*self.store, guild);
+        if let Ok(chan) = mc.mod_log_channel_id.parse::<u64>() {
+            let _ = ChannelId::new(chan).say(&ctx.http, text).await;
+        }
+    }
+
+    /// Join-raid defense: screen each new member (account age / avatar) and track
+    /// join velocity. A burst latches a server lockdown (every join then gets
+    /// `gate_action`); a member that fails the gate or arrives during a lockdown
+    /// is kicked / banned / quarantined, with a case + mod-log entry.
+    async fn raid_check(&self, ctx: &Context, member: &Member) {
+        let guild = member.guild_id.get().to_string();
+        let cfg = RaidConfig::load_for_guild(&*self.store, &guild);
+        if !cfg.enabled {
+            return;
+        }
+        let now = Utc::now().timestamp();
+        let age_secs = now - member.user.id.created_at().unix_timestamp();
+        let has_avatar = member.user.avatar.is_some();
+
+        // Join velocity → latch lockdown on a burst.
+        let raid = {
+            let mut t = self.join_tracker.lock().unwrap();
+            t.record_join(&guild, monotonic_ms(), cfg.join_threshold, cfg.join_window_secs)
+        };
+        let mut lockdown = cfg.lockdown_active;
+        if raid && !cfg.lockdown_active {
+            let mut latched = cfg.clone();
+            latched.lockdown_active = true;
+            let _ = latched.save_for_guild(&*self.store, &guild);
+            lockdown = true;
+            self.alert(ctx, &guild, &format!(
+                "🚨 **Raid lockdown engaged** — {}+ joins in {}s. Every new join is now met with `{:?}`. Lift with `/lockdown off`.",
+                cfg.join_threshold, cfg.join_window_secs, cfg.gate_action
+            )).await;
+        }
+
+        // Act when locked down, otherwise when the member fails the join gate.
+        let action = if lockdown {
+            Some(cfg.gate_action)
+        } else {
+            cfg.screen_join(age_secs, has_avatar)
+        };
+        let Some(act) = action else {
+            return;
+        };
+        let reason = if lockdown { "raid lockdown" } else { "join gate (account age / avatar)" };
+        let uid = member.user.id;
+        // Enforce, then log — but only write the case + mod-log entry if the
+        // Discord action actually SUCCEEDED. Logging a "kicked/banned/jailed" case
+        // for an enforcement that failed would fill the mod-log with phantom
+        // actions exactly when admins triage a raid (the same reason the warn
+        // escalation calls jail_member directly instead of try_jail).
+        let outcome: Result<CaseAction, String> = match act {
+            GateAction::Kick => member
+                .guild_id
+                .kick_with_reason(&ctx.http, uid, reason)
+                .await
+                .map(|_| CaseAction::Kick)
+                .map_err(|e| e.to_string()),
+            GateAction::Ban => member
+                .guild_id
+                .ban_with_reason(&ctx.http, uid, 0, reason)
+                .await
+                .map(|_| CaseAction::Ban)
+                .map_err(|e| e.to_string()),
+            GateAction::Quarantine => {
+                jail::jail_member(ctx, &self.store, member.guild_id, uid, reason, None, "raid")
+                    .await
+                    .map(|_| CaseAction::Jail)
+            }
+        };
+        let case_action = match outcome {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("❌ raid gate: failed to {act:?} {uid}: {e}");
+                return;
+            }
+        };
+        let detail = format!("raid: {reason}");
+        let id = self
+            .store
+            .add_case(&guild, &uid.get().to_string(), "AutoMod", case_action, &detail, now, None)
+            .unwrap_or(0);
+        commands::post_modlog(ctx, &self.store, &guild, id, case_action, uid, "AutoMod", &detail, None).await;
+    }
+
+    /// Anti-nuke core (called from the audit-log event): count one actor's
+    /// destructive actions and, on a trip, strip their non-managed roles + alert
+    /// (or alert only, in dry-run). The bot itself, the guild owner, and trusted
+    /// actors never trip.
+    async fn antinuke_check(&self, ctx: &Context, entry: AuditLogEntry, guild_id: GuildId) {
+        let guild = guild_id.get().to_string();
+        let cfg = AntinukeConfig::load_for_guild(&*self.store, &guild);
+        if !cfg.enabled || cfg.max_actions == 0 {
+            return;
+        }
+        let Some(kind) = map_destructive(&entry) else {
+            return;
+        };
+        let actor = entry.user_id;
+        let actor_s = actor.get().to_string();
+        if actor.get() == self.bot_id.load(Ordering::Relaxed) || cfg.is_trusted(&actor_s) {
+            return;
+        }
+        let tripped = {
+            let mut t = self.action_tracker.lock().unwrap();
+            t.record_action(&format!("{guild}:{actor_s}"), monotonic_ms(), cfg.max_actions, cfg.window_secs)
+        };
+        if !tripped {
+            return;
+        }
+        let now = Utc::now().timestamp();
+        let detail = format!(
+            "anti-nuke: {}+ destructive actions (last: {}) in {}s",
+            cfg.max_actions,
+            kind.label(),
+            cfg.window_secs
+        );
+
+        // The guild owner is ALWAYS exempt. Resolve the owner fail-CLOSED: if we
+        // cannot determine who it is, take NO action — a missed nuke is
+        // recoverable, but stripping the legitimate owner is catastrophic. Try the
+        // cache first (no network, and it stays populated even while the HTTP API
+        // is rate-limited by the very flood a nuke produces); fall back to HTTP.
+        let cached_owner = guild_id.to_guild_cached(&ctx.cache).map(|g| g.owner_id);
+        let owner_id = match cached_owner {
+            Some(id) => Some(id),
+            None => guild_id.to_partial_guild(&ctx.http).await.map(|g| g.owner_id).ok(),
+        };
+        let Some(owner_id) = owner_id else {
+            eprintln!("⚠️ anti-nuke: could not resolve owner of guild {guild} — refusing to strip {actor_s} (fail-closed)");
+            self.alert(ctx, &guild, &format!("⚠️ **Anti-nuke** detected <@{actor_s}> ({detail}) but could NOT verify the guild owner — taking no action to avoid stripping the owner by mistake. Investigate manually.")).await;
+            return;
+        };
+        if owner_id == actor {
+            return;
+        }
+
+        if cfg.dry_run {
+            self.alert(ctx, &guild, &format!("🚨 **[DRY-RUN]** anti-nuke would strip <@{actor_s}> — {detail}")).await;
+            return;
+        }
+
+        // Strip the rogue actor's roles, preserving managed ones (Discord rejects
+        // the edit otherwise — same constraint as the jail). Resolve the role set
+        // fail-CLOSED: on a fetch error do NOT fall back to an empty keep-set —
+        // that would try to remove ALL roles (incl. managed) and Discord rejects
+        // the whole edit, so the strip would silently no-op. Alert + skip the
+        // strip instead; the detection is still logged as a case below.
+        match (
+            guild_id.member(&ctx.http, actor).await,
+            guild_id.roles(&ctx.http).await,
+        ) {
+            (Ok(member), Ok(roles)) => {
+                let keep: Vec<RoleId> = member
+                    .roles
+                    .iter()
+                    .filter(|r| roles.get(r).is_some_and(|role| role.managed))
+                    .copied()
+                    .collect();
+                match guild_id
+                    .edit_member(&ctx.http, actor, EditMember::new().roles(keep).audit_log_reason("anti-nuke"))
+                    .await
+                {
+                    Ok(_) => self.alert(ctx, &guild, &format!("🚨 **Anti-nuke triggered** — stripped <@{actor_s}>'s roles. {detail}")).await,
+                    Err(e) => {
+                        eprintln!("❌ anti-nuke: failed to strip {actor_s}: {e}");
+                        self.alert(ctx, &guild, &format!("🚨 **Anti-nuke** detected <@{actor_s}> ({detail}) but FAILED to strip roles ({e}) — check the bot's role hierarchy.")).await;
+                    }
+                }
+            }
+            _ => {
+                eprintln!("❌ anti-nuke: could not resolve {actor_s}'s roles — not stripping (fail-closed)");
+                self.alert(ctx, &guild, &format!("🚨 **Anti-nuke** detected <@{actor_s}> ({detail}) but could NOT resolve their roles to strip safely — manual intervention needed.")).await;
+            }
+        }
+        let id = self.store.add_case(&guild, &actor_s, "AutoMod", CaseAction::Note, &detail, now, None).unwrap_or(0);
+        commands::post_modlog(ctx, &self.store, &guild, id, CaseAction::Note, actor, "AutoMod", &detail, None).await;
     }
 
     /// Content automod: scans message text for the configured rules (blocklist /

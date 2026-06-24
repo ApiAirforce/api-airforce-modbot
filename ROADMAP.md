@@ -44,7 +44,7 @@
 | **00** | [Multi-Guild Foundation](docs/plans/00-multi-guild-foundation.md) | Single-guild-only → hosted-for-many | ~3–5 d | ◐ code-complete, tests green; staging-verify pending |
 | **01** | [Mod-Action Suite](docs/plans/01-mod-action-suite.md) | No ban/kick/timeout/warn, no mod-log/cases | ~2–3 d | ◐ code+review done; staging-verify pending |
 | **02** | [Content Automod](docs/plans/02-content-automod.md) | No word/regex/caps/mention/zalgo/dup filters | ~3–4 d | ◐ code+review done; staging-verify pending |
-| **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ☐ |
+| **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ◐ code+review done (4 findings fixed); staging-verify pending |
 | **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ☐ |
 | **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ☐ later |
 | **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ☐ later |
@@ -142,3 +142,35 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
   sweep past a size cap + accurate doc. Review CONFIRMED: case-folding, whole-word
   boundaries, exemptions, action-mapping, guild isolation, no await-across-lock.
   bot 10 + core 54 green; clippy unchanged (5 pre-existing).
+- *2026-06-24* — **Plan 02 committed** `0dd913b` (explicit paths, no AI attribution).
+- *2026-06-24* — **Plan 03 phase 1: `core/raid.rs` + `core/antinuke.rs`** (pure).
+  raid: `RaidConfig` + `screen_join` (account-age / no-avatar gate → kick/ban/
+  quarantine) + `JoinTracker` (join-velocity sliding window). antinuke:
+  `AntinukeConfig` (trusted allowlist + dry-run) + `ActionTracker` (per-actor
+  destructive-action window) + `DestructiveAction`. Additive, **core 64 green**
+  (+10), clippy clean. Next: phase 2 — the bot wiring (member-join gate, lockdown,
+  /verify flow, audit-log → anti-nuke role-strip + alert) — the high-stakes part
+  (a false positive strips a real admin), built behind the dry-run mode first.
+- *2026-06-24* — **Plan 03 phase 2 (code-complete).** `handler.raid_check`
+  (member-join gate via snowflake account age + avatar; `JoinTracker` velocity →
+  latched lockdown that gate-actions every join) + `handler.antinuke_check` (the
+  `guild_audit_log_entry_create` event → `ActionTracker` per actor → strip
+  non-managed roles + alert, with bot-self/owner/trusted exemptions + **dry-run**).
+  Quarantine reuses the jail; verification = quarantine + existing /unjail (no
+  separate verify flow). 4 commands: `/setraid` `/lockdown` `/setantinuke`
+  `/raidtrust`; `/modstatus` raid+anti-nuke section. 33 commands total. **bot 10 +
+  core 64 green**, clippy zero new. Pending: Plan 03 review + staging test.
+- *2026-06-24* — **Plan 03 adversarial review (2 lenses + synthesis) → 4 findings,
+  all fixed.** (1) **High** — anti-nuke owner-exemption failed *open*: if the owner
+  lookup errored (likely during the API flood of a real nuke) the owner's roles
+  got stripped. Now **fail-closed**, cache-first (`to_guild_cached`, populated even
+  while HTTP is rate-limited) → HTTP fallback → if still unresolved, alert + take no
+  action. (2) **Med** — role-strip fell back to an empty keep-set on a fetch error
+  (would try to remove *all* roles incl. managed → Discord rejects the whole edit →
+  silent no-op); now alerts + skips the strip, detection still logged. (3) **Med** —
+  raid gate wrote a "kicked/banned/jailed" case + mod-log even when enforcement
+  failed; now logs only on success (`jail_member` directly, not `try_jail`).
+  (4) **Med** — false-positives: dropped non-destructive `WebhookCreate` from the
+  burst counter + raised the default threshold 5→10; `/setantinuke` now nudges to
+  dry-run first when going live. **bot 10 + core 64 green**, clippy still the 5
+  pre-existing warnings (zero new). Pending: staging test.

@@ -10,13 +10,16 @@
 //! This is the same Ports-&-Adapters core that runs inside api.airforce; lifting
 //! it into this standalone crate is what lets the bot be self-hosted by anyone.
 
+pub mod antinuke;
 pub mod automod;
 pub mod cases;
 pub mod flood_filter;
 pub mod jail;
 pub mod link_filter;
 pub mod ports;
+pub mod raid;
 
+pub use antinuke::{ActionTracker, AntinukeConfig, DestructiveAction};
 pub use automod::{
     AutomodAction, AutomodConfig, AutomodVerdict, CompiledBlocklist, DuplicateTracker, MatchMode,
 };
@@ -25,6 +28,7 @@ pub use flood_filter::{FloodAction, FloodFilterConfig, FloodScope, FloodTracker,
 pub use jail::JailConfig;
 pub use link_filter::LinkFilterConfig;
 pub use ports::{ConfigStore, JailRecord, JailStore, LinkStrike, StrikeStore};
+pub use raid::{GateAction, JoinTracker, RaidConfig};
 
 /// Compose a per-guild config-blob key: `"{guild_id}:{base_key}"`.
 ///

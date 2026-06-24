@@ -42,9 +42,13 @@ community Discord and is open source so anyone can run it.
   **mention-** and **emoji-spam**, **zalgo**, and **duplicate-message** detection —
   each with a configurable action (delete / strike / timeout / jail) and the same
   channel/role/user exemptions as the other filters.
+- Anti-raid: a **join gate** (account-age / no-avatar → kick/ban/quarantine),
+  join-velocity **auto-lockdown**, and **anti-nuke** — a rogue or compromised
+  admin mass-deleting channels/roles or mass-banning gets their roles stripped +
+  an alert (with a **dry-run** mode and a trusted-actor allowlist).
 - Multi-guild: one instance moderates many servers, each with fully isolated
   config, strikes, jails, and cases.
-- 29 admin slash commands, gated to bot owners or members with **Manage Server**.
+- 33 admin slash commands, gated to bot owners or members with **Manage Server**.
 - Single self-contained binary, an embedded [`redb`](https://github.com/cberner/redb)
   database (one file), and a tiny `config.toml`. No external services.
 
@@ -157,6 +161,10 @@ That's it — non-whitelisted links now get removed and repeat offenders jailed.
 | `/automod` | Configure content automod (caps/mentions/emoji/zalgo/duplicate + action) |
 | `/blocklist` add\|remove\|list | Manage the automod blocklist (word / substring / regex) |
 | `/automodexempt` \| `/automodunexempt` | Add/remove an automod exemption (channel/role/user-channel) |
+| `/setraid` | Configure join-raid protection (join gate + join-velocity lockdown) |
+| `/lockdown` on\|off | Engage or lift a raid lockdown |
+| `/setantinuke` | Configure anti-nuke (mass-action protection; has a dry-run mode) |
+| `/raidtrust` add\|remove\|list | Manage anti-nuke trusted actors |
 
 The flood filter starts **disabled**; turn it on with e.g.
 `/setflood enabled:true channel_threshold:3 channel_window:10 action:jail` and it
