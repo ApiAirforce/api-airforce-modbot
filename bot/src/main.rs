@@ -47,6 +47,12 @@ async fn main() {
         }
     };
 
+    // Upgrade a legacy single-guild DB to the multi-guild (guild-scoped) key
+    // scheme. Idempotent — a no-op on a fresh or already-migrated database.
+    if let Err(e) = store.migrate_legacy_to_guild_keys() {
+        eprintln!("⚠️ legacy → multi-guild migration failed: {e}");
+    }
+
     // GUILD_MEMBERS + MESSAGE_CONTENT are privileged — enable them for this app
     // in the Discord Developer Portal (Bot → Privileged Gateway Intents).
     let intents = GatewayIntents::non_privileged()

@@ -35,7 +35,12 @@ community Discord and is open source so anyone can run it.
   the same exemption/per-user-override surface as the link filter.
 - Escape-proof role-snapshot jail with timed or indefinite sentences and an
   automatic expiry sweep.
-- 14 admin slash commands, gated to bot owners or members with **Manage Server**.
+- Standard mod toolkit: ban / kick / native timeout / warn with **auto-escalation**
+  (N warns within a window → timeout, jail, or ban), a numbered **case log** per
+  user, and a **mod-log channel** every action is posted to.
+- Multi-guild: one instance moderates many servers, each with fully isolated
+  config, strikes, jails, and cases.
+- 25 admin slash commands, gated to bot owners or members with **Manage Server**.
 - Single self-contained binary, an embedded [`redb`](https://github.com/cberner/redb)
   database (one file), and a tiny `config.toml`. No external services.
 
@@ -58,7 +63,7 @@ In the **Bot** tab, under **Privileged Gateway Intents**, enable:
 
 Use this URL (replace `YOUR_APP_ID` with your application's Client ID):
 
-```
+```text
 https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=268512256
 ```
 
@@ -108,7 +113,7 @@ On connect the bot registers its slash commands to your guild and prints
 The filter and jail start **disabled**. Configure them with slash commands
 (needs Manage Server or a bot-owner id):
 
-```
+```text
 /setjail enabled:true role:@Jailed channel:#jail
 /setfilter enabled:true threshold:3 jail_role:@Jailed
 /whitelist add domain:discord.com
@@ -136,6 +141,15 @@ That's it — non-whitelisted links now get removed and repeat offenders jailed.
 | `/floodexempt channel\|role\|userchannel` | Add a flood-filter exemption |
 | `/floodunexempt channel\|role\|userchannel` | Remove a flood-filter exemption |
 | `/floodlimit` | Set per-user flood thresholds (`channel_threshold`, `msg_threshold`; 0 inherits) |
+| `/ban` \| `/kick` | Ban or kick a member (records a case + posts to the mod-log) |
+| `/timeout` | Native Discord timeout, `minutes` (max 28 days) |
+| `/warn` | Warn a member; auto-escalates per `/setescalation` |
+| `/note` | Attach a moderator note to a member (logged as a case) |
+| `/cases` \| `/case` | List a user's cases, or show one case by number |
+| `/setmodlog` | Set the channel where moderation actions are posted |
+| `/setescalation` | Configure warn auto-escalation (`threshold`, `window_days`, `action`, `timeout_minutes`) |
+| `/allowinvite` add\|remove\|list | Manage the allowed Discord invite codes |
+| `/allowserver` add\|remove\|list | Manage allowed partner server (guild) IDs |
 
 The flood filter starts **disabled**; turn it on with e.g.
 `/setflood enabled:true channel_threshold:3 channel_window:10 action:jail` and it

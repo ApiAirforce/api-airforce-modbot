@@ -8,16 +8,18 @@
 
 use serenity::all::{
     ChannelId, CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
-    Context, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseMessage, EditInteractionResponse, GuildId, Permissions, RoleId, UserId,
+    Context, CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EditMember, GuildId,
+    Permissions, RoleId, Timestamp, UserId,
 };
 
 use airforce_modbot_core::link_filter::{normalize_host, UserChannelExempt, UserThreshold};
 use airforce_modbot_core::flood_filter::FloodUserOverride;
 use airforce_modbot_core::{
-    FloodAction, FloodFilterConfig, FloodScope, JailConfig, JailStore, LinkFilterConfig,
-    StrikeStore,
+    CaseAction, EscalationAction, FloodAction, FloodFilterConfig, FloodScope, JailConfig,
+    LinkFilterConfig, ModConfig,
 };
+use chrono::Utc;
 
 use crate::config::BotConfig;
 use crate::jail;
@@ -130,6 +132,47 @@ pub fn command_defs() -> Vec<CreateCommand> {
             .add_option(user("user", "User").required(true))
             .add_option(int("channel_threshold", "Their channel threshold (0 = inherit)"))
             .add_option(int("msg_threshold", "Their message threshold (0 = inherit)")),
+        CreateCommand::new("ban")
+            .description("Ban a member (records a case + posts to the mod-log)")
+            .add_option(user("user", "Member to ban").required(true))
+            .add_option(string("reason", "Reason")),
+        CreateCommand::new("kick")
+            .description("Kick a member (records a case + posts to the mod-log)")
+            .add_option(user("user", "Member to kick").required(true))
+            .add_option(string("reason", "Reason")),
+        CreateCommand::new("timeout")
+            .description("Time a member out — Discord native, max 28 days")
+            .add_option(user("user", "Member").required(true))
+            .add_option(int("minutes", "Minutes (1-40320)").required(true))
+            .add_option(string("reason", "Reason")),
+        CreateCommand::new("warn")
+            .description("Warn a member (auto-escalates per /setescalation)")
+            .add_option(user("user", "Member").required(true))
+            .add_option(string("reason", "Reason")),
+        CreateCommand::new("note")
+            .description("Attach a moderator note to a member (logged as a case)")
+            .add_option(user("user", "Member").required(true))
+            .add_option(string("text", "Note text").required(true)),
+        CreateCommand::new("cases")
+            .description("List a member's moderation cases")
+            .add_option(user("user", "Member").required(true)),
+        CreateCommand::new("case")
+            .description("Show one moderation case by number")
+            .add_option(int("id", "Case number").required(true)),
+        CreateCommand::new("setmodlog")
+            .description("Set the mod-log channel where moderation actions are posted")
+            .add_option(chan("channel", "Mod-log channel").required(true)),
+        CreateCommand::new("setescalation")
+            .description("Configure warn auto-escalation (only the options you pass change)")
+            .add_option(int("threshold", "Warns before escalation (0 = off)"))
+            .add_option(int("window_days", "Days a warn keeps counting (0 = never expires)"))
+            .add_option(
+                string("action", "What to do at the threshold")
+                    .add_string_choice("timeout", "timeout")
+                    .add_string_choice("jail", "jail")
+                    .add_string_choice("ban", "ban"),
+            )
+            .add_option(int("timeout_minutes", "Timeout length when action = timeout")),
     ]
 }
 
@@ -211,24 +254,44 @@ pub async fn dispatch(ctx: &Context, cmd: &CommandInteraction, store: &RedbStore
         return;
     }
 
+    // Every admin command is guild-scoped (per-guild config + per-guild data).
+    let Some(guild) = cmd.guild_id.map(|g| g.get().to_string()) else {
+        let _ = cmd
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content("❌ This command must be used in a server."),
+            )
+            .await;
+        return;
+    };
+
     let opts = cmd.data.options.as_slice();
     let result: Result<String, String> = match cmd.data.name.as_str() {
-        "modstatus" => Ok(render_status(store)),
-        "setfilter" => set_filter(store, opts),
-        "whitelist" => whitelist(store, opts),
-        "exempt" => exempt(store, opts, true),
-        "unexempt" => exempt(store, opts, false),
-        "userlimit" => user_limit(store, opts),
-        "allowinvite" => allow_invite(store, opts),
-        "allowserver" => allow_server(store, opts),
-        "strikes" => strikes(store, opts),
+        "modstatus" => Ok(render_status(store, &guild)),
+        "setfilter" => set_filter(store, &guild, opts),
+        "whitelist" => whitelist(store, &guild, opts),
+        "exempt" => exempt(store, &guild, opts, true),
+        "unexempt" => exempt(store, &guild, opts, false),
+        "userlimit" => user_limit(store, &guild, opts),
+        "allowinvite" => allow_invite(store, &guild, opts),
+        "allowserver" => allow_server(store, &guild, opts),
+        "strikes" => strikes(store, &guild, opts),
         "jail" => jail_cmd(ctx, store, cmd, opts).await,
         "unjail" => unjail_cmd(ctx, store, cmd, opts).await,
-        "setjail" => set_jail(store, opts),
-        "setflood" => set_flood(store, opts),
-        "floodexempt" => flood_exempt(store, opts, true),
-        "floodunexempt" => flood_exempt(store, opts, false),
-        "floodlimit" => flood_limit(store, opts),
+        "setjail" => set_jail(store, &guild, opts),
+        "setflood" => set_flood(store, &guild, opts),
+        "floodexempt" => flood_exempt(store, &guild, opts, true),
+        "floodunexempt" => flood_exempt(store, &guild, opts, false),
+        "floodlimit" => flood_limit(store, &guild, opts),
+        "ban" => ban_cmd(ctx, store, cmd, opts).await,
+        "kick" => kick_cmd(ctx, store, cmd, opts).await,
+        "timeout" => timeout_cmd(ctx, store, cmd, opts).await,
+        "warn" => warn_cmd(ctx, store, cmd, opts).await,
+        "note" => note_cmd(ctx, store, cmd, opts).await,
+        "cases" => cases_cmd(store, cmd, opts),
+        "case" => case_cmd(store, cmd, opts),
+        "setmodlog" => set_modlog(store, &guild, opts),
+        "setescalation" => set_escalation(store, &guild, opts),
         other => Err(format!("unknown command /{other}")),
     };
 
@@ -241,12 +304,12 @@ pub async fn dispatch(ctx: &Context, cmd: &CommandInteraction, store: &RedbStore
         .await;
 }
 
-fn render_status(store: &RedbStore) -> String {
-    let f = LinkFilterConfig::load(store);
-    let j = JailConfig::load(store);
-    let fl = FloodFilterConfig::load(store);
-    let strikes = store.list_link_strikes(10_000).len();
-    let jails = store.list_jails(10_000).len();
+fn render_status(store: &RedbStore, guild: &str) -> String {
+    let f = LinkFilterConfig::load_for_guild(store, guild);
+    let j = JailConfig::load_for_guild(store, guild);
+    let fl = FloodFilterConfig::load_for_guild(store, guild);
+    let strikes = store.list_link_strikes_for_guild(guild, 10_000).len();
+    let jails = store.list_jails_for_guild(guild, 10_000).len();
     let flood_action = match fl.action {
         FloodAction::Warn => "warn",
         FloodAction::Delete => "delete",
@@ -306,8 +369,8 @@ fn render_status(store: &RedbStore) -> String {
     )
 }
 
-fn set_filter(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
-    let mut f = LinkFilterConfig::load(store);
+fn set_filter(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut f = LinkFilterConfig::load_for_guild(store, guild);
     let mut changed = Vec::new();
     if let Some(b) = get_bool(opts, "enabled") {
         f.enabled = b;
@@ -337,12 +400,12 @@ fn set_filter(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, S
         return Err("nothing to change — pass at least one option".into());
     }
     f.validate()?;
-    f.save(store)?;
+    f.save_for_guild(store, guild)?;
     Ok(format!("✅ filter updated: {}", changed.join(", ")))
 }
 
-fn set_flood(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
-    let mut f = FloodFilterConfig::load(store);
+fn set_flood(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut f = FloodFilterConfig::load_for_guild(store, guild);
     let mut changed = Vec::new();
     if let Some(b) = get_bool(opts, "enabled") {
         f.enabled = b;
@@ -398,17 +461,18 @@ fn set_flood(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, St
         return Err("nothing to change — pass at least one option".into());
     }
     f.validate()?;
-    f.save(store)?;
+    f.save_for_guild(store, guild)?;
     Ok(format!("✅ flood filter updated: {}", changed.join(", ")))
 }
 
 fn flood_exempt(
     store: &RedbStore,
+    guild: &str,
     opts: &[CommandDataOption],
     add: bool,
 ) -> Result<String, String> {
     let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
-    let mut f = FloodFilterConfig::load(store);
+    let mut f = FloodFilterConfig::load_for_guild(store, guild);
     let msg = match sub {
         "channel" => {
             let c = get_channel(sopts, "channel").ok_or("missing channel")?.get().to_string();
@@ -455,18 +519,18 @@ fn flood_exempt(
         other => return Err(format!("unknown subcommand `{other}`")),
     };
     f.validate()?;
-    f.save(store)?;
+    f.save_for_guild(store, guild)?;
     Ok(format!("✅ {msg}"))
 }
 
-fn flood_limit(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+fn flood_limit(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
     let u = get_user(opts, "user").ok_or("missing user")?.get().to_string();
     let ch = get_int(opts, "channel_threshold").map(|x| x.clamp(0, u32::MAX as i64) as u32);
     let ms = get_int(opts, "msg_threshold").map(|x| x.clamp(0, u32::MAX as i64) as u32);
     if ch.is_none() && ms.is_none() {
         return Err("pass channel_threshold and/or msg_threshold".into());
     }
-    let mut f = FloodFilterConfig::load(store);
+    let mut f = FloodFilterConfig::load_for_guild(store, guild);
     f.user_overrides.retain(|o| o.user_id != u);
     let (ct, mt) = (ch.unwrap_or(0), ms.unwrap_or(0));
     let out = if ct == 0 && mt == 0 {
@@ -480,13 +544,13 @@ fn flood_limit(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, 
         format!("per-user flood limit set (channel={ct}, msg={mt}; 0 = inherit)")
     };
     f.validate()?;
-    f.save(store)?;
+    f.save_for_guild(store, guild)?;
     Ok(format!("✅ {out}"))
 }
 
-fn whitelist(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+fn whitelist(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
     let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
-    let mut f = LinkFilterConfig::load(store);
+    let mut f = LinkFilterConfig::load_for_guild(store, guild);
     match sub {
         "add" => {
             let raw = get_str(sopts, "domain").ok_or("missing domain")?;
@@ -507,7 +571,7 @@ fn whitelist(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, St
             }
             f.whitelist.push(entry.clone());
             f.validate()?;
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ whitelisted `{entry}`"))
         }
         "remove" => {
@@ -517,7 +581,7 @@ fn whitelist(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, St
             if f.whitelist.len() == before {
                 return Ok(format!("`{}` was not on the whitelist", raw.trim()));
             }
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ removed `{}`", raw.trim()))
         }
         "list" => {
@@ -531,9 +595,9 @@ fn whitelist(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, St
     }
 }
 
-fn exempt(store: &RedbStore, opts: &[CommandDataOption], add: bool) -> Result<String, String> {
+fn exempt(store: &RedbStore, guild: &str, opts: &[CommandDataOption], add: bool) -> Result<String, String> {
     let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
-    let mut f = LinkFilterConfig::load(store);
+    let mut f = LinkFilterConfig::load_for_guild(store, guild);
     let verb = if add { "added" } else { "removed" };
     match sub {
         "channel" => {
@@ -546,7 +610,7 @@ fn exempt(store: &RedbStore, opts: &[CommandDataOption], add: bool) -> Result<St
                 f.exempt_channel_ids.retain(|x| x != &c);
             }
             f.validate()?;
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ channel exemption {verb} (<#{c}>)"))
         }
         "role" => {
@@ -559,7 +623,7 @@ fn exempt(store: &RedbStore, opts: &[CommandDataOption], add: bool) -> Result<St
                 f.exempt_role_ids.retain(|x| x != &r);
             }
             f.validate()?;
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ role exemption {verb} (<@&{r}>)"))
         }
         "userchannel" => {
@@ -573,31 +637,31 @@ fn exempt(store: &RedbStore, opts: &[CommandDataOption], add: bool) -> Result<St
                 f.exempt_user_channels.retain(|e| !(e.user_id == u && e.channel_id == c));
             }
             f.validate()?;
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ per-user channel exemption {verb} (<@{u}> in <#{c}>)"))
         }
         other => Err(format!("unknown subcommand {other}")),
     }
 }
 
-fn user_limit(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+fn user_limit(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
     let u = get_user(opts, "user").ok_or("missing user")?.get().to_string();
     let t = get_int(opts, "threshold").ok_or("missing threshold")?;
-    let mut f = LinkFilterConfig::load(store);
+    let mut f = LinkFilterConfig::load_for_guild(store, guild);
     f.user_thresholds.retain(|x| x.user_id != u);
     if t == 0 {
-        f.save(store)?;
+        f.save_for_guild(store, guild)?;
         return Ok(format!("✅ removed the per-user limit for <@{u}>"));
     }
     f.user_thresholds.push(UserThreshold { user_id: u.clone(), threshold: t.clamp(0, u32::MAX as i64) as u32 });
     f.validate()?;
-    f.save(store)?;
+    f.save_for_guild(store, guild)?;
     Ok(format!("✅ <@{u}> will be jailed at {t} strikes"))
 }
 
-fn allow_invite(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+fn allow_invite(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
     let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
-    let mut f = LinkFilterConfig::load(store);
+    let mut f = LinkFilterConfig::load_for_guild(store, guild);
     match sub {
         "add" => {
             let code = get_str(sopts, "code").ok_or("missing code")?.trim().to_string();
@@ -609,7 +673,7 @@ fn allow_invite(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String,
             }
             f.allowed_invite_codes.push(code.clone());
             f.validate()?;
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ allowed invite code `{code}`"))
         }
         "remove" => {
@@ -619,7 +683,7 @@ fn allow_invite(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String,
             if f.allowed_invite_codes.len() == before {
                 return Ok(format!("`{code}` was not on the invite allowlist"));
             }
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ removed invite code `{code}`"))
         }
         "list" => {
@@ -633,9 +697,9 @@ fn allow_invite(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String,
     }
 }
 
-fn allow_server(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+fn allow_server(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
     let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
-    let mut f = LinkFilterConfig::load(store);
+    let mut f = LinkFilterConfig::load_for_guild(store, guild);
     match sub {
         "add" => {
             let gid = get_str(sopts, "guild_id").ok_or("missing guild_id")?.trim().to_string();
@@ -647,7 +711,7 @@ fn allow_server(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String,
             }
             f.allowed_guild_ids.push(gid.clone());
             f.validate()?;
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ allowed invites to server `{gid}`"))
         }
         "remove" => {
@@ -657,7 +721,7 @@ fn allow_server(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String,
             if f.allowed_guild_ids.len() == before {
                 return Ok(format!("`{gid}` was not on the server allowlist"));
             }
-            f.save(store)?;
+            f.save_for_guild(store, guild)?;
             Ok(format!("✅ removed server `{gid}`"))
         }
         "list" => {
@@ -671,11 +735,11 @@ fn allow_server(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String,
     }
 }
 
-fn strikes(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
+fn strikes(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
     let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
     match sub {
         "list" => {
-            let rows = store.list_link_strikes(25);
+            let rows = store.list_link_strikes_for_guild(guild, 25);
             if rows.is_empty() {
                 return Ok("no strikes on record".into());
             }
@@ -687,7 +751,7 @@ fn strikes(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, Stri
         }
         "reset" => {
             let u = get_user(sopts, "user").ok_or("missing user")?.get().to_string();
-            store.reset_link_strikes(&u)?;
+            store.reset_link_strikes_in(guild, &u)?;
             Ok(format!("✅ cleared strikes for <@{u}>"))
         }
         other => Err(format!("unknown subcommand {other}")),
@@ -712,8 +776,8 @@ async fn unjail_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, 
     Ok(format!("🔓 released <@{}> and restored their roles", target.get()))
 }
 
-fn set_jail(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, String> {
-    let mut j = JailConfig::load(store);
+fn set_jail(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut j = JailConfig::load_for_guild(store, guild);
     let mut changed = Vec::new();
     if let Some(b) = get_bool(opts, "enabled") {
         j.enabled = b;
@@ -735,8 +799,272 @@ fn set_jail(store: &RedbStore, opts: &[CommandDataOption]) -> Result<String, Str
         return Err("nothing to change — pass at least one option".into());
     }
     j.validate()?;
-    j.save(store)?;
+    j.save_for_guild(store, guild)?;
     Ok(format!("✅ jail updated: {}", changed.join(", ")))
+}
+
+// ── moderation actions (ban / kick / timeout / warn / note + cases) ──────────
+
+/// Post a mod-log embed for a case to the configured channel (no-op if unset).
+#[allow(clippy::too_many_arguments)]
+async fn post_modlog(
+    ctx: &Context,
+    store: &RedbStore,
+    guild: &str,
+    case_id: u64,
+    action: CaseAction,
+    target: UserId,
+    mod_id: &str,
+    reason: &str,
+    duration_secs: Option<u64>,
+) {
+    let mc = ModConfig::load_for_guild(store, guild);
+    let Ok(chan) = mc.mod_log_channel_id.parse::<u64>() else {
+        return; // unset/invalid => skip silently
+    };
+    let mut embed = CreateEmbed::new()
+        .title(format!("Case #{case_id} · {}", action.label()))
+        .field("User", format!("<@{}>", target.get()), true)
+        .field("Moderator", format!("<@{mod_id}>"), true)
+        .field("Reason", if reason.is_empty() { "—" } else { reason }, false);
+    if let Some(d) = duration_secs {
+        embed = embed.field("Duration", format!("{} min", d / 60), true);
+    }
+    let _ = ChannelId::new(chan)
+        .send_message(&ctx.http, CreateMessage::new().embed(embed))
+        .await;
+}
+
+/// Ban + record a Ban case + mod-log. Returns the case id.
+async fn do_ban(ctx: &Context, store: &RedbStore, guild_id: GuildId, guild: &str, target: UserId, by: &str, reason: &str) -> Result<u64, String> {
+    guild_id
+        .ban_with_reason(&ctx.http, target, 0, reason)
+        .await
+        .map_err(|e| format!("ban failed (check Ban Members + role hierarchy): {e}"))?;
+    let id = match store.add_case(guild, &target.get().to_string(), by, CaseAction::Ban, reason, Utc::now().timestamp(), None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("⚠️ ban applied but failed to record case: {e}");
+            return Ok(0); // 0 => action done, no case recorded (the reply says so)
+        }
+    };
+    post_modlog(ctx, store, guild, id, CaseAction::Ban, target, by, reason, None).await;
+    Ok(id)
+}
+
+/// Kick + record a Kick case + mod-log. Returns the case id.
+async fn do_kick(ctx: &Context, store: &RedbStore, guild_id: GuildId, guild: &str, target: UserId, by: &str, reason: &str) -> Result<u64, String> {
+    guild_id
+        .kick_with_reason(&ctx.http, target, reason)
+        .await
+        .map_err(|e| format!("kick failed (check Kick Members + role hierarchy): {e}"))?;
+    let id = match store.add_case(guild, &target.get().to_string(), by, CaseAction::Kick, reason, Utc::now().timestamp(), None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("⚠️ kick applied but failed to record case: {e}");
+            return Ok(0);
+        }
+    };
+    post_modlog(ctx, store, guild, id, CaseAction::Kick, target, by, reason, None).await;
+    Ok(id)
+}
+
+/// Native Discord timeout (max 28 days) + record a Timeout case + mod-log.
+#[allow(clippy::too_many_arguments)]
+async fn do_timeout(ctx: &Context, store: &RedbStore, guild_id: GuildId, guild: &str, target: UserId, by: &str, reason: &str, minutes: u32) -> Result<u64, String> {
+    let minutes = minutes.clamp(1, 40_320); // Discord's 28-day cap
+    let until = Utc::now().timestamp() + minutes as i64 * 60;
+    let ts = Timestamp::from_unix_timestamp(until).map_err(|e| format!("bad timestamp: {e}"))?;
+    guild_id
+        .edit_member(
+            &ctx.http,
+            target,
+            EditMember::new().disable_communication_until_datetime(ts).audit_log_reason(reason),
+        )
+        .await
+        .map_err(|e| format!("timeout failed (check Moderate Members + role hierarchy): {e}"))?;
+    let secs = minutes as u64 * 60;
+    let id = match store.add_case(guild, &target.get().to_string(), by, CaseAction::Timeout, reason, Utc::now().timestamp(), Some(secs)) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("⚠️ timeout applied but failed to record case: {e}");
+            return Ok(0);
+        }
+    };
+    post_modlog(ctx, store, guild, id, CaseAction::Timeout, target, by, reason, Some(secs)).await;
+    Ok(id)
+}
+
+async fn ban_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild_id = cmd.guild_id.ok_or("this command must be used in a server")?;
+    let target = get_user(opts, "user").ok_or("missing user")?;
+    let reason = get_str(opts, "reason").unwrap_or_else(|| "moderator action".to_string());
+    let by = cmd.user.id.to_string();
+    let id = do_ban(ctx, store, guild_id, &guild_id.get().to_string(), target, &by, &reason).await?;
+    Ok(format!("🔨 banned <@{}> ({}). Reason: {reason}", target.get(), case_ref(id)))
+}
+
+async fn kick_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild_id = cmd.guild_id.ok_or("this command must be used in a server")?;
+    let target = get_user(opts, "user").ok_or("missing user")?;
+    let reason = get_str(opts, "reason").unwrap_or_else(|| "moderator action".to_string());
+    let by = cmd.user.id.to_string();
+    let id = do_kick(ctx, store, guild_id, &guild_id.get().to_string(), target, &by, &reason).await?;
+    Ok(format!("👢 kicked <@{}> ({}). Reason: {reason}", target.get(), case_ref(id)))
+}
+
+async fn timeout_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild_id = cmd.guild_id.ok_or("this command must be used in a server")?;
+    let target = get_user(opts, "user").ok_or("missing user")?;
+    let minutes = get_int(opts, "minutes").ok_or("missing minutes")?.clamp(1, 40_320) as u32;
+    let reason = get_str(opts, "reason").unwrap_or_else(|| "moderator action".to_string());
+    let by = cmd.user.id.to_string();
+    let id = do_timeout(ctx, store, guild_id, &guild_id.get().to_string(), target, &by, &reason, minutes).await?;
+    Ok(format!("⏳ timed out <@{}> for {minutes} min ({}). Reason: {reason}", target.get(), case_ref(id)))
+}
+
+async fn warn_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild_id = cmd.guild_id.ok_or("this command must be used in a server")?;
+    let guild = guild_id.get().to_string();
+    let target = get_user(opts, "user").ok_or("missing user")?;
+    let tuid = target.get().to_string();
+    let reason = get_str(opts, "reason").unwrap_or_else(|| "moderator action".to_string());
+    let by = cmd.user.id.to_string();
+    let now = Utc::now().timestamp();
+    let id = store.add_case(&guild, &tuid, &by, CaseAction::Warn, &reason, now, None)?;
+    post_modlog(ctx, store, &guild, id, CaseAction::Warn, target, &by, &reason, None).await;
+    let mut msg = format!("⚠️ warned <@{}> (case #{id}). Reason: {reason}", target.get());
+
+    // Auto-escalate if this warn crosses the configured threshold.
+    let mc = ModConfig::load_for_guild(store, &guild);
+    let prior: Vec<i64> = store
+        .list_cases_for_user(&guild, &tuid, 1000)
+        .into_iter()
+        .filter(|c| c.action == CaseAction::Warn && c.id != id)
+        .map(|c| c.created_unix)
+        .collect();
+    if let Some(esc) = airforce_modbot_core::cases::warn_escalation(&prior, now, &mc.escalation) {
+        let r = match esc {
+            EscalationAction::Timeout => do_timeout(ctx, store, guild_id, &guild, target, "AutoMod", "warn escalation", mc.escalation.timeout_minutes).await.map(|_| ()),
+            EscalationAction::Ban => do_ban(ctx, store, guild_id, &guild, target, "AutoMod", "warn escalation").await.map(|_| ()),
+            EscalationAction::Jail => {
+                // Call jail_member directly (returns Result) instead of try_jail
+                // (a bool that is `true` even when the Discord edit failed) — so a
+                // configured-but-failed jail surfaces the real error and writes NO
+                // misleading "escalated to jail" case.
+                jail::jail_member(ctx, store, guild_id, target, "warn escalation", None, "AutoMod")
+                    .await
+                    .map(|()| {
+                        let _ = store.add_case(&guild, &tuid, "AutoMod", CaseAction::Jail, "warn escalation", now, None);
+                    })
+            }
+        };
+        match r {
+            Ok(()) => msg += &format!(" → auto-escalated to **{}**", esc_label(esc)),
+            Err(e) => msg += &format!(" (escalation to {} failed: {e})", esc_label(esc)),
+        }
+    }
+    Ok(msg)
+}
+
+async fn note_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild_id = cmd.guild_id.ok_or("this command must be used in a server")?;
+    let guild = guild_id.get().to_string();
+    let target = get_user(opts, "user").ok_or("missing user")?;
+    let text = get_str(opts, "text").ok_or("missing note text")?;
+    let by = cmd.user.id.to_string();
+    let id = store.add_case(&guild, &target.get().to_string(), &by, CaseAction::Note, &text, Utc::now().timestamp(), None)?;
+    post_modlog(ctx, store, &guild, id, CaseAction::Note, target, &by, &text, None).await;
+    Ok(format!("📝 note added for <@{}> (case #{id})", target.get()))
+}
+
+fn cases_cmd(store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild = cmd.guild_id.ok_or("this command must be used in a server")?.get().to_string();
+    let target = get_user(opts, "user").ok_or("missing user")?;
+    let rows = store.list_cases_for_user(&guild, &target.get().to_string(), 15);
+    if rows.is_empty() {
+        return Ok(format!("no cases on record for <@{}>", target.get()));
+    }
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|c| format!("`#{}` **{}** — {}", c.id, c.action.label(), if c.reason.is_empty() { "—" } else { &c.reason }))
+        .collect();
+    Ok(format!("**Cases for <@{}>:**\n{}", target.get(), lines.join("\n")))
+}
+
+fn case_cmd(store: &RedbStore, cmd: &CommandInteraction, opts: &[CommandDataOption]) -> Result<String, String> {
+    let guild = cmd.guild_id.ok_or("this command must be used in a server")?.get().to_string();
+    let id = get_int(opts, "id").ok_or("missing case id")?.max(0) as u64;
+    match store.get_case(&guild, id) {
+        Some(c) => Ok(format!(
+            "**Case #{} · {}**\nUser: <@{}>\nModerator: <@{}>\nReason: {}",
+            c.id,
+            c.action.label(),
+            c.user_id,
+            c.mod_id,
+            if c.reason.is_empty() { "—" } else { &c.reason },
+        )),
+        None => Ok(format!("no case #{id} in this server")),
+    }
+}
+
+fn set_modlog(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut mc = ModConfig::load_for_guild(store, guild);
+    let ch = get_channel(opts, "channel").ok_or("missing channel")?;
+    mc.mod_log_channel_id = ch.get().to_string();
+    mc.validate()?;
+    mc.save_for_guild(store, guild)?;
+    Ok(format!("✅ mod-log channel set to <#{}>", ch.get()))
+}
+
+fn set_escalation(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut mc = ModConfig::load_for_guild(store, guild);
+    let mut changed = Vec::new();
+    if let Some(t) = get_int(opts, "threshold") {
+        mc.escalation.threshold = t.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("threshold = {}", mc.escalation.threshold));
+    }
+    if let Some(w) = get_int(opts, "window_days") {
+        mc.escalation.window_days = w.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("window_days = {}", mc.escalation.window_days));
+    }
+    if let Some(a) = get_str(opts, "action") {
+        mc.escalation.action = match a.as_str() {
+            "timeout" => EscalationAction::Timeout,
+            "jail" => EscalationAction::Jail,
+            "ban" => EscalationAction::Ban,
+            other => return Err(format!("invalid action `{other}`")),
+        };
+        changed.push(format!("action = {a}"));
+    }
+    if let Some(m) = get_int(opts, "timeout_minutes") {
+        mc.escalation.timeout_minutes = m.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("timeout_minutes = {}", mc.escalation.timeout_minutes));
+    }
+    if changed.is_empty() {
+        return Err("nothing to change — pass at least one option".into());
+    }
+    mc.validate()?;
+    mc.save_for_guild(store, guild)?;
+    Ok(format!("✅ warn-escalation: {}", changed.join(", ")))
+}
+
+/// "case #N", or a clear note when the action happened but the case could not be
+/// recorded (id 0 — a real case is never numbered 0).
+fn case_ref(id: u64) -> String {
+    if id == 0 {
+        "case not recorded".to_string()
+    } else {
+        format!("case #{id}")
+    }
+}
+
+fn esc_label(e: EscalationAction) -> &'static str {
+    match e {
+        EscalationAction::Timeout => "timeout",
+        EscalationAction::Jail => "jail",
+        EscalationAction::Ban => "ban",
+    }
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -754,10 +1082,21 @@ fn empty_dash(s: &str) -> &str {
     }
 }
 
-/// Register all guild commands (bulk overwrite) for `guild`.
+/// Register all guild commands (bulk overwrite) for `guild` — instant, best for
+/// dev or a single server (set `guild_id` in config.toml).
 pub async fn register(ctx: &Context, guild: GuildId) {
     match guild.set_commands(&ctx.http, command_defs()).await {
         Ok(cmds) => println!("✅ registered {} slash commands", cmds.len()),
         Err(e) => eprintln!("❌ failed to register slash commands: {e}"),
+    }
+}
+
+/// Register all commands GLOBALLY (bulk overwrite) — multi-guild mode, used when
+/// no fixed `guild_id` is configured so the bot works in every server it is in.
+/// Global propagation can take up to ~1h.
+pub async fn register_global(ctx: &Context) {
+    match serenity::all::Command::set_global_commands(&ctx.http, command_defs()).await {
+        Ok(cmds) => println!("✅ registered {} global slash commands (may take up to ~1h to appear)", cmds.len()),
+        Err(e) => eprintln!("❌ failed to register global slash commands: {e}"),
     }
 }

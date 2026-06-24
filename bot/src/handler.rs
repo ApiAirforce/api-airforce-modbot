@@ -17,7 +17,6 @@ use serenity::async_trait;
 use airforce_modbot_core::link_filter::offending_hosts;
 use airforce_modbot_core::{
     FloodAction, FloodFilterConfig, FloodTracker, JailConfig, JailStore, LinkFilterConfig,
-    StrikeStore,
 };
 
 use crate::config::BotConfig;
@@ -54,39 +53,22 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ connected as {} ({})", ready.user.name, ready.user.id);
 
-        // Register the admin slash commands for the configured guild.
+        // Register the admin slash commands. A `guild_id` in config.toml registers
+        // to that one guild instantly (best for dev or a single server); leaving it
+        // empty registers GLOBALLY so the bot works in every server it is in
+        // (multi-guild — global propagation can take up to ~1h).
         match self.config.guild_id.parse::<u64>() {
             Ok(gid) => commands::register(&ctx, GuildId::new(gid)).await,
-            Err(_) if self.config.guild_id.is_empty() => {
-                eprintln!("⚠️ no guild_id in config — slash commands not registered")
-            }
+            Err(_) if self.config.guild_id.is_empty() => commands::register_global(&ctx).await,
             Err(_) => eprintln!(
                 "⚠️ config guild_id `{}` is not a valid id — slash commands not registered",
                 self.config.guild_id
             ),
         }
 
-        // Seed the per-feature config `guild_id` from the bot's configured guild
-        // if it is still unset. The monorepo populated this via its admin API;
-        // the standalone bot is single-guild, so the filter and jail apply to the
-        // guild in `config.toml`. Without this the message filter and the manual
-        // jail-role watcher gate on an empty `guild_id` and never fire.
-        if !self.config.guild_id.is_empty() {
-            let mut lf = LinkFilterConfig::load(&*self.store);
-            if lf.guild_id.is_empty() {
-                lf.guild_id = self.config.guild_id.clone();
-                if let Err(e) = lf.save(&*self.store) {
-                    eprintln!("⚠️ could not seed link-filter guild_id: {e}");
-                }
-            }
-            let mut jc = JailConfig::load(&*self.store);
-            if jc.guild_id.is_empty() {
-                jc.guild_id = self.config.guild_id.clone();
-                if let Err(e) = jc.save(&*self.store) {
-                    eprintln!("⚠️ could not seed jail guild_id: {e}");
-                }
-            }
-        }
+        // Per-feature config is per-guild now (each config command stamps its own
+        // guild_id), so there is nothing to seed here. An existing single-guild DB
+        // was migrated to guild-scoped keys at startup (see main.rs).
 
         // Spawn the timed-jail expiry sweep exactly once. Uses a Context cloned
         // from this event so it needs no separate token handling.
@@ -102,7 +84,7 @@ impl EventHandler for Handler {
                         let gid = rec.guild_id.parse::<u64>().ok().map(GuildId::new);
                         let uid = rec.discord_user_id.parse::<u64>().ok().map(UserId::new);
                         if let (Some(g), Some(u)) = (gid, uid) {
-                            if let Err(e) = jail::unjail_member(&sweep_ctx, &*store, g, u, "expiry").await {
+                            if let Err(e) = jail::unjail_member(&sweep_ctx, &store, g, u, "expiry").await {
                                 eprintln!("❌ expiry unjail {} failed: {e}", rec.discord_user_id);
                             }
                         }
@@ -124,7 +106,7 @@ impl EventHandler for Handler {
     async fn guild_member_addition(&self, ctx: Context, new_member: Member) {
         jail::reapply_if_jailed(
             &ctx,
-            &*self.store,
+            &self.store,
             new_member.guild_id,
             new_member.user.id,
         )
@@ -143,11 +125,9 @@ impl EventHandler for Handler {
         _new: Option<Member>,
         event: GuildMemberUpdateEvent,
     ) {
-        let cfg = airforce_modbot_core::JailConfig::load(&*self.store);
-        if !cfg.enabled || cfg.guild_id.is_empty() {
-            return;
-        }
-        if event.guild_id.get().to_string() != cfg.guild_id {
+        let guild_str = event.guild_id.get().to_string();
+        let cfg = JailConfig::load_for_guild(&*self.store, &guild_str);
+        if !cfg.enabled {
             return;
         }
         let Some(jail_role) = cfg.jail_role_id.trim().parse::<u64>().ok().map(RoleId::new) else {
@@ -156,12 +136,12 @@ impl EventHandler for Handler {
         let user_id = event.user.id;
         let uid = user_id.to_string();
         let has_jail_role = event.roles.contains(&jail_role);
-        let already_jailed = self.store_has_jail(&uid);
+        let already_jailed = self.store_has_jail(&guild_str, &uid);
 
         if has_jail_role && !already_jailed {
             if let Err(e) = jail::jail_member(
                 &ctx,
-                &*self.store,
+                &self.store,
                 event.guild_id,
                 user_id,
                 "jail role assigned manually",
@@ -174,7 +154,7 @@ impl EventHandler for Handler {
             }
         } else if !has_jail_role && already_jailed {
             if let Err(e) =
-                jail::unjail_member(&ctx, &*self.store, event.guild_id, user_id, "manual-role").await
+                jail::unjail_member(&ctx, &self.store, event.guild_id, user_id, "manual-role").await
             {
                 eprintln!("❌ manual-unjail (role removed) for {uid}: {e}");
             }
@@ -192,13 +172,11 @@ impl EventHandler for Handler {
         if self.flood_check(&ctx, &message).await {
             return;
         }
-        let cfg = LinkFilterConfig::load(&*self.store);
         let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
             return;
         };
-        let in_filter_guild =
-            cfg.enabled && !cfg.guild_id.is_empty() && msg_guild == cfg.guild_id;
-        if !in_filter_guild {
+        let cfg = LinkFilterConfig::load_for_guild(&*self.store, &msg_guild);
+        if !cfg.enabled {
             return;
         }
         let channel_id = message.channel_id.get().to_string();
@@ -248,7 +226,7 @@ impl EventHandler for Handler {
         };
         let new_count = self
             .store
-            .record_link_strike(&author_id, &cfg.guild_id, &reason, Utc::now().timestamp(), cfg.decay_days)
+            .record_link_strike_in(&msg_guild, &author_id, &reason, Utc::now().timestamp(), cfg.decay_days)
             .unwrap_or(0);
         println!("🔗 link-filter: removed message from {author_id} (strike {new_count}/{threshold}) — {reason}");
 
@@ -274,7 +252,7 @@ impl EventHandler for Handler {
             if let Some(gid) = message.guild_id {
                 let jailed = jail::try_jail(
                     &ctx,
-                    &*self.store,
+                    &self.store,
                     gid,
                     message.author.id,
                     "link filter: repeated non-whitelisted links",
@@ -301,8 +279,8 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
-    fn store_has_jail(&self, uid: &str) -> bool {
-        self.store.get_jail(uid).is_some()
+    fn store_has_jail(&self, guild_id: &str, uid: &str) -> bool {
+        self.store.get_jail_in(guild_id, uid).is_some()
     }
 
     /// Cross-channel flood / raid filter. Records every counting message into a
@@ -310,11 +288,11 @@ impl Handler {
     /// channels, records a strike, and (by config) jails + DMs. Returns `true`
     /// when it handled the message so the caller stops processing it.
     async fn flood_check(&self, ctx: &Context, message: &Message) -> bool {
-        let cfg = FloodFilterConfig::load(&*self.store);
         let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
             return false;
         };
-        if !cfg.enabled || cfg.guild_id.is_empty() || msg_guild != cfg.guild_id {
+        let cfg = FloodFilterConfig::load_for_guild(&*self.store, &msg_guild);
+        if !cfg.enabled {
             return false;
         }
         let channel_id = message.channel_id.get().to_string();
@@ -350,11 +328,14 @@ impl Handler {
             EPOCH.elapsed().as_millis() as u64
         };
         let (ch_thr, ms_thr) = cfg.thresholds_for(&author_id);
+        // Key the sliding window per (guild, user) so a user's floods never merge
+        // across servers; thresholds still resolve on the bare user id (overrides).
+        let flood_key = format!("{msg_guild}:{author_id}");
         // Hold the lock ONLY for record/evaluate — never across an await below.
         let verdict = {
             let mut tracker = self.flood_tracker.lock().unwrap();
             tracker.record_and_check(
-                &author_id,
+                &flood_key,
                 &channel_id,
                 &message.id.get().to_string(),
                 now_ms,
@@ -383,7 +364,7 @@ impl Handler {
         // 2) record a strike (decay-aware; reuses the link strike store).
         let new_count = self
             .store
-            .record_link_strike(&author_id, &cfg.guild_id, &v.reason, Utc::now().timestamp(), cfg.decay_days)
+            .record_link_strike_in(&msg_guild, &author_id, &v.reason, Utc::now().timestamp(), cfg.decay_days)
             .unwrap_or(0);
         println!(
             "🌊 flood-filter: {} — removed {deleted} msg(s) from {author_id} (strike {new_count})",
@@ -396,7 +377,7 @@ impl Handler {
             if let Some(gid) = message.guild_id {
                 let jailed = jail::try_jail(
                     ctx,
-                    &*self.store,
+                    &self.store,
                     gid,
                     message.author.id,
                     &v.reason,

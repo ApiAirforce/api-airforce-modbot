@@ -8,7 +8,9 @@
 use chrono::Utc;
 use serenity::all::{Context, EditMember, GuildId, RoleId, UserId};
 
-use airforce_modbot_core::{ConfigStore, JailConfig, JailStore};
+use airforce_modbot_core::JailConfig;
+
+use crate::store::RedbStore;
 
 fn parse_role(cfg: &JailConfig) -> Option<RoleId> {
     cfg.jail_role_id.trim().parse::<u64>().ok().map(RoleId::new)
@@ -43,16 +45,17 @@ async fn jailed_role_set(
 /// Snapshot → strip → persist → DM. Re-jailing an already-jailed user refreshes
 /// the sentence but keeps the original role snapshot. `minutes = None` uses the
 /// config default; `Some(0)` is indefinite.
-pub async fn jail_member<S: JailStore + ConfigStore + Sync>(
+pub async fn jail_member(
     ctx: &Context,
-    store: &S,
+    store: &RedbStore,
     guild_id: GuildId,
     user_id: UserId,
     reason: &str,
     minutes: Option<u32>,
     jailed_by: &str,
 ) -> Result<(), String> {
-    let cfg = JailConfig::load(store);
+    let guild = guild_id.get().to_string();
+    let cfg = JailConfig::load_for_guild(store, &guild);
     let Some(jail_role) = parse_role(&cfg) else {
         return Err("jail not configured (no jail role set)".into());
     };
@@ -60,7 +63,7 @@ pub async fn jail_member<S: JailStore + ConfigStore + Sync>(
 
     // 1) Snapshot the member's current roles (minus the jail role), UNLESS we
     //    already have a snapshot (re-jail / they re-acquired roles somehow).
-    let existing = store.get_jail(&uid);
+    let existing = store.get_jail_in(&guild, &uid);
     let prior: Vec<String> = match &existing {
         Some(rec) => rec.prior_roles.clone(),
         None => {
@@ -84,7 +87,7 @@ pub async fn jail_member<S: JailStore + ConfigStore + Sync>(
     let now = Utc::now().timestamp();
     let mins = minutes.unwrap_or(cfg.default_minutes);
     let expires = if mins == 0 { None } else { Some(now + mins as i64 * 60) };
-    store.record_jail(&uid, &cfg.guild_id, &prior, reason, jailed_by, now, expires)?;
+    store.record_jail_in(&guild, &uid, &prior, reason, jailed_by, now, expires)?;
 
     // 3) Strip to the jail role (preserving managed roles — see jailed_role_set).
     let builder = EditMember::new()
@@ -92,7 +95,7 @@ pub async fn jail_member<S: JailStore + ConfigStore + Sync>(
         .audit_log_reason("jail");
     if let Err(e) = guild_id.edit_member(&ctx.http, user_id, builder).await {
         if existing.is_none() {
-            let _ = store.remove_jail(&uid);
+            let _ = store.remove_jail_in(&guild, &uid);
         }
         return Err(format!(
             "edit_member failed (check the bot has Manage Roles AND the jail role sits below the bot's top role): {e}"
@@ -123,20 +126,21 @@ pub async fn jail_member<S: JailStore + ConfigStore + Sync>(
 
 /// Restore the snapshotted roles and clear the jail record. Best-effort on the
 /// Discord side (the member may have left); the record is always cleared.
-pub async fn unjail_member<S: JailStore + ConfigStore + Sync>(
+pub async fn unjail_member(
     ctx: &Context,
-    store: &S,
+    store: &RedbStore,
     guild_id: GuildId,
     user_id: UserId,
     by: &str,
 ) -> Result<(), String> {
-    let cfg = JailConfig::load(store);
+    let guild = guild_id.get().to_string();
+    let cfg = JailConfig::load_for_guild(store, &guild);
     let uid = user_id.to_string();
-    let rec = store.get_jail(&uid);
+    let rec = store.get_jail_in(&guild, &uid);
 
     // Clear the record FIRST so the role-restore's GUILD_MEMBER_UPDATE isn't
     // treated as a hand-removed jail role by the watcher (no re-entrant unjail).
-    store.remove_jail(&uid)?;
+    store.remove_jail_in(&guild, &uid)?;
 
     if let Some(rec) = &rec {
         let restored: Vec<RoleId> = rec
@@ -163,18 +167,19 @@ pub async fn unjail_member<S: JailStore + ConfigStore + Sync>(
 
 /// Re-apply the jail role when a jailed user rejoins the guild (the escape-proof
 /// path; needs the GUILD_MEMBERS intent so GUILD_MEMBER_ADD fires).
-pub async fn reapply_if_jailed<S: JailStore + ConfigStore + Sync>(
+pub async fn reapply_if_jailed(
     ctx: &Context,
-    store: &S,
+    store: &RedbStore,
     guild_id: GuildId,
     user_id: UserId,
 ) {
-    let cfg = JailConfig::load(store);
+    let guild = guild_id.get().to_string();
+    let cfg = JailConfig::load_for_guild(store, &guild);
     if !cfg.enabled {
         return;
     }
     let uid = user_id.to_string();
-    if store.get_jail(&uid).is_none() {
+    if store.get_jail_in(&guild, &uid).is_none() {
         return;
     }
     let Some(jail_role) = parse_role(&cfg) else {
@@ -192,15 +197,15 @@ pub async fn reapply_if_jailed<S: JailStore + ConfigStore + Sync>(
 /// Called by the link filter at the strike threshold. Returns `true` when jail
 /// is configured (so the caller skips its legacy simple role-add), even if the
 /// Discord call failed — the failure is logged loudly, not silently swallowed.
-pub async fn try_jail<S: JailStore + ConfigStore + Sync>(
+pub async fn try_jail(
     ctx: &Context,
-    store: &S,
+    store: &RedbStore,
     guild_id: GuildId,
     user_id: UserId,
     reason: &str,
     by: &str,
 ) -> bool {
-    let cfg = JailConfig::load(store);
+    let cfg = JailConfig::load_for_guild(store, &guild_id.get().to_string());
     if !cfg.enabled || parse_role(&cfg).is_none() {
         return false;
     }

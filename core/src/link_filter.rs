@@ -148,6 +148,26 @@ impl LinkFilterConfig {
         store.set_config_blob(CONFIG_BLOB_KEY, &json)
     }
 
+    /// Per-guild variant of [`Self::load`] for multi-guild hosting: reads the
+    /// blob under the guild-scoped key (see [`crate::guild_blob_key`]). The
+    /// single-guild [`Self::load`] is unchanged. Missing/corrupt => defaults.
+    pub fn load_for_guild(store: &impl ConfigStore, guild_id: &str) -> Self {
+        let mut cfg: Self = store
+            .get_config_blob(&crate::guild_blob_key(guild_id, CONFIG_BLOB_KEY))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        // A per-guild config's guild_id IS its guild — stamp it so callers never
+        // have to, and a fresh (default) config validates on first enable.
+        cfg.guild_id = guild_id.to_string();
+        cfg
+    }
+
+    /// Per-guild variant of [`Self::save`].
+    pub fn save_for_guild(&self, store: &impl ConfigStore, guild_id: &str) -> Result<(), String> {
+        let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        store.set_config_blob(&crate::guild_blob_key(guild_id, CONFIG_BLOB_KEY), &json)
+    }
+
     /// Admin-write validation. Bounds keep a typo from disabling the threshold
     /// or scheduling a year-long decay.
     pub fn validate(&self) -> Result<(), String> {
