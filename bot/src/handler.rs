@@ -3,6 +3,7 @@
 //! expiry sweep. Slash commands (runtime configuration) are added on top of
 //! this in `commands.rs`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,12 +17,23 @@ use serenity::async_trait;
 
 use airforce_modbot_core::link_filter::offending_hosts;
 use airforce_modbot_core::{
-    FloodAction, FloodFilterConfig, FloodTracker, JailConfig, JailStore, LinkFilterConfig,
+    AutomodAction, AutomodConfig, AutomodVerdict, CaseAction, CompiledBlocklist, DuplicateTracker,
+    FloodAction, FloodFilterConfig, FloodTracker, JailConfig, JailStore, LinkFilterConfig, MatchMode,
 };
 
 use crate::config::BotConfig;
 use crate::store::RedbStore;
 use crate::{commands, jail};
+
+/// Cached compiled blocklist for a guild + the config fields it was built from,
+/// so the (expensive) regex compilation runs only when an admin changes the
+/// blocklist — never per message, which would be a CPU-DoS.
+struct AutomodCacheEntry {
+    blocklist: Vec<String>,
+    match_mode: MatchMode,
+    case_insensitive: bool,
+    compiled: CompiledBlocklist,
+}
 
 pub struct Handler {
     pub store: Arc<RedbStore>,
@@ -34,6 +46,10 @@ pub struct Handler {
     /// Live per-user sliding window for the cross-channel flood filter. In
     /// memory only (state, not config); locked solely for record/evaluate.
     flood_tracker: std::sync::Mutex<FloodTracker>,
+    /// Live per-(guild,user) recent-message window for automod's duplicate rule.
+    dup_tracker: std::sync::Mutex<DuplicateTracker>,
+    /// Per-guild compiled-blocklist cache (rebuilt only when the config changes).
+    automod_cache: std::sync::Mutex<HashMap<String, AutomodCacheEntry>>,
 }
 
 impl Handler {
@@ -44,6 +60,8 @@ impl Handler {
             sweep_started: AtomicBool::new(false),
             invite_cache: crate::invite_filter::InviteCache::default(),
             flood_tracker: std::sync::Mutex::new(FloodTracker::new()),
+            dup_tracker: std::sync::Mutex::new(DuplicateTracker::new()),
+            automod_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -172,6 +190,10 @@ impl EventHandler for Handler {
         if self.flood_check(&ctx, &message).await {
             return;
         }
+        // Content automod (blocklist/caps/mentions/emoji/zalgo/duplicate).
+        if self.automod_check(&ctx, &message).await {
+            return;
+        }
         let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
             return;
         };
@@ -281,6 +303,146 @@ impl EventHandler for Handler {
 impl Handler {
     fn store_has_jail(&self, guild_id: &str, uid: &str) -> bool {
         self.store.get_jail_in(guild_id, uid).is_some()
+    }
+
+    /// Content automod: scans message text for the configured rules (blocklist /
+    /// caps / mentions / emoji / zalgo + duplicate-in-a-window) and, on a trip,
+    /// deletes the message and applies the configured action (warn / delete /
+    /// timeout / jail) with a shared strike, a numbered case, and a mod-log entry.
+    /// Returns `true` when it handled the message.
+    async fn automod_check(&self, ctx: &Context, message: &Message) -> bool {
+        let Some(msg_guild) = message.guild_id.map(|g| g.get().to_string()) else {
+            return false;
+        };
+        let cfg = AutomodConfig::load_for_guild(&*self.store, &msg_guild);
+        if !cfg.enabled {
+            return false;
+        }
+        let channel_id = message.channel_id.get().to_string();
+        if cfg.exempt_channel_ids.iter().any(|c| c == &channel_id) {
+            return false;
+        }
+        let author_id = message.author.id.get().to_string();
+        let is_owner = self.config.is_owner(&author_id);
+        let has_exempt_role = message.member.as_ref().is_some_and(|m| {
+            m.roles
+                .iter()
+                .any(|r| cfg.exempt_role_ids.iter().any(|er| er == &r.get().to_string()))
+        });
+        if is_owner || has_exempt_role || cfg.is_user_channel_exempt(&author_id, &channel_id) {
+            return false;
+        }
+
+        // Stateless rules first (using a CACHED compiled blocklist — rebuilt only
+        // when this guild's blocklist/mode/case config actually changes, never per
+        // message), then the duplicate-in-a-window rule (stateful).
+        let mut verdict = {
+            let mut cache = self.automod_cache.lock().unwrap();
+            let stale = cache.get(&msg_guild).is_none_or(|e| {
+                e.blocklist != cfg.blocklist
+                    || e.match_mode != cfg.match_mode
+                    || e.case_insensitive != cfg.case_insensitive
+            });
+            if stale {
+                cache.insert(
+                    msg_guild.clone(),
+                    AutomodCacheEntry {
+                        blocklist: cfg.blocklist.clone(),
+                        match_mode: cfg.match_mode,
+                        case_insensitive: cfg.case_insensitive,
+                        compiled: CompiledBlocklist::build(&cfg),
+                    },
+                );
+            }
+            // Lock held only across the synchronous evaluate (no await inside).
+            cfg.evaluate(&message.content, &cache.get(&msg_guild).unwrap().compiled)
+        };
+        if verdict.is_none() && cfg.duplicate_threshold >= 2 {
+            let now_ms = {
+                static EPOCH: std::sync::LazyLock<std::time::Instant> =
+                    std::sync::LazyLock::new(std::time::Instant::now);
+                EPOCH.elapsed().as_millis() as u64
+            };
+            let key = format!("{msg_guild}:{author_id}");
+            let tripped = {
+                let mut t = self.dup_tracker.lock().unwrap();
+                t.record_and_check(&key, &message.content, now_ms, cfg.duplicate_threshold, cfg.duplicate_window_secs)
+            };
+            if tripped {
+                verdict = Some(AutomodVerdict {
+                    rule: "duplicate",
+                    reason: format!("{}x duplicate in {}s", cfg.duplicate_threshold, cfg.duplicate_window_secs),
+                });
+            }
+        }
+        let Some(v) = verdict else {
+            return false;
+        };
+
+        // 1) delete the offending message.
+        let _ = message.delete(&ctx.http).await;
+
+        let now = Utc::now().timestamp();
+        let reason = format!("automod [{}]: {}", v.rule, v.reason);
+        let (case_action, duration_secs, strike) = match cfg.action {
+            AutomodAction::Warn => (CaseAction::Warn, None, false),
+            AutomodAction::Delete => (CaseAction::Warn, None, true),
+            AutomodAction::Timeout => (
+                CaseAction::Timeout,
+                Some(cfg.timeout_minutes.clamp(1, 40_320) as u64 * 60),
+                true,
+            ),
+            AutomodAction::Jail => (CaseAction::Jail, None, true),
+        };
+
+        // 2) strike (shared with the link/flood quarantine system).
+        if strike {
+            let _ = self.store.record_link_strike_in(&msg_guild, &author_id, &reason, now, 0);
+        }
+
+        // 3) apply the Discord action.
+        if let Some(gid) = message.guild_id {
+            match cfg.action {
+                AutomodAction::Timeout => {
+                    let mins = cfg.timeout_minutes.clamp(1, 40_320);
+                    if let Ok(ts) = serenity::all::Timestamp::from_unix_timestamp(now + mins as i64 * 60) {
+                        if let Err(e) = gid
+                            .edit_member(
+                                &ctx.http,
+                                message.author.id,
+                                serenity::all::EditMember::new()
+                                    .disable_communication_until_datetime(ts)
+                                    .audit_log_reason("automod"),
+                            )
+                            .await
+                        {
+                            eprintln!("❌ automod timeout failed for {author_id}: {e}");
+                        }
+                    }
+                }
+                AutomodAction::Jail => {
+                    jail::try_jail(ctx, &self.store, gid, message.author.id, &reason, "automod").await;
+                }
+                AutomodAction::Warn | AutomodAction::Delete => {}
+            }
+        }
+
+        // 4) numbered case + mod-log embed.
+        let id = self
+            .store
+            .add_case(&msg_guild, &author_id, "AutoMod", case_action, &reason, now, duration_secs)
+            .unwrap_or(0);
+        commands::post_modlog(ctx, &self.store, &msg_guild, id, case_action, message.author.id, "AutoMod", &reason, duration_secs).await;
+
+        // 5) DM notice.
+        if cfg.warn_user {
+            if let Ok(dm) = message.author.create_dm_channel(&ctx.http).await {
+                let _ = dm
+                    .say(&ctx.http, format!("🛡️ Your message was removed by automod ({}).", v.rule))
+                    .await;
+            }
+        }
+        true
     }
 
     /// Cross-channel flood / raid filter. Records every counting message into a

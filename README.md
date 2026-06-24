@@ -38,9 +38,13 @@ community Discord and is open source so anyone can run it.
 - Standard mod toolkit: ban / kick / native timeout / warn with **auto-escalation**
   (N warns within a window → timeout, jail, or ban), a numbered **case log** per
   user, and a **mod-log channel** every action is posted to.
+- Content automod: a **blocklist** (word / substring / regex), **anti-caps**,
+  **mention-** and **emoji-spam**, **zalgo**, and **duplicate-message** detection —
+  each with a configurable action (delete / strike / timeout / jail) and the same
+  channel/role/user exemptions as the other filters.
 - Multi-guild: one instance moderates many servers, each with fully isolated
   config, strikes, jails, and cases.
-- 25 admin slash commands, gated to bot owners or members with **Manage Server**.
+- 29 admin slash commands, gated to bot owners or members with **Manage Server**.
 - Single self-contained binary, an embedded [`redb`](https://github.com/cberner/redb)
   database (one file), and a tiny `config.toml`. No external services.
 
@@ -150,6 +154,9 @@ That's it — non-whitelisted links now get removed and repeat offenders jailed.
 | `/setescalation` | Configure warn auto-escalation (`threshold`, `window_days`, `action`, `timeout_minutes`) |
 | `/allowinvite` add\|remove\|list | Manage the allowed Discord invite codes |
 | `/allowserver` add\|remove\|list | Manage allowed partner server (guild) IDs |
+| `/automod` | Configure content automod (caps/mentions/emoji/zalgo/duplicate + action) |
+| `/blocklist` add\|remove\|list | Manage the automod blocklist (word / substring / regex) |
+| `/automodexempt` \| `/automodunexempt` | Add/remove an automod exemption (channel/role/user-channel) |
 
 The flood filter starts **disabled**; turn it on with e.g.
 `/setflood enabled:true channel_threshold:3 channel_window:10 action:jail` and it

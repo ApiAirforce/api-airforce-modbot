@@ -43,7 +43,7 @@
 | --- | --- | --- | --- | --- |
 | **00** | [Multi-Guild Foundation](docs/plans/00-multi-guild-foundation.md) | Single-guild-only → hosted-for-many | ~3–5 d | ◐ code-complete, tests green; staging-verify pending |
 | **01** | [Mod-Action Suite](docs/plans/01-mod-action-suite.md) | No ban/kick/timeout/warn, no mod-log/cases | ~2–3 d | ◐ code+review done; staging-verify pending |
-| **02** | [Content Automod](docs/plans/02-content-automod.md) | No word/regex/caps/mention/zalgo/dup filters | ~3–4 d | ☐ |
+| **02** | [Content Automod](docs/plans/02-content-automod.md) | No word/regex/caps/mention/zalgo/dup filters | ~3–4 d | ◐ code+review done; staging-verify pending |
 | **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ☐ |
 | **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ☐ |
 | **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ☐ later |
@@ -116,3 +116,29 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
   now reported honestly via `case_ref()` + no "#0" mod-log. Review CONFIRMED:
   atomic per-guild numbering, no escalation loop, action-before-case ordering,
   auth-gating, guild isolation. bot 10 + core 45 green; clippy unchanged.
+- *2026-06-24* — **Committed** `8a99584` (Plan 00 + 01, explicit paths, no AI
+  attribution) on `feat/feature-parity`.
+- *2026-06-24* — **Plan 02 phase 1: `core/automod.rs`** (pure rule engine):
+  `AutomodConfig` + `evaluate()` for blocklist (substring/word/regex), caps,
+  mention-spam, emoji-spam, zalgo, + `DuplicateTracker` (stateful sliding window).
+  Pure counting helpers, AI-classifier layers on at the host (no engine change).
+  **core 54 green** (+9; a test caught a real bug — lowercasing a regex pattern
+  corrupted `\S`→`\s`, fixed via RegexBuilder.case_insensitive). clippy clean.
+  Next: phase 2 (handler wiring + DuplicateTracker static + `/automod` commands).
+- *2026-06-24* — **Plan 02 phase 2 (code-complete).** `handler.automod_check`
+  runs after flood (per-guild config, `DuplicateTracker` keyed per (guild,user)),
+  on a trip deletes + shared strike + numbered case + mod-log + the configured
+  action (warn/delete/timeout/jail). 4 commands: `/automod` (flat config),
+  `/blocklist` add|remove|list, `/automodexempt` `/automodunexempt`; `/modstatus`
+  gained an automod section; `post_modlog` shared (pub(crate)). 29 commands total.
+  **bot 10 + core 54 green**, clippy zero new warnings.
+- *2026-06-24* — **Plan 02 adversarial review: 1 HIGH (blocker) + 1 low, both
+  fixed.** (HIGH) blocklist regexes were recompiled PER MESSAGE — a pathological
+  17-char pattern (`(\p{L}\p{M}*){50}`) passes validate but costs ~14.5ms to build
+  ×1000 entries = ~14.5s CPU/message → shared-runtime cross-guild DoS. Fixed:
+  `CompiledBlocklist` compiled once + cached in the handler (rebuilt only on config
+  change) + `RegexBuilder.size_limit` so pathological patterns fail fast. (low)
+  `DuplicateTracker` empty-deque eviction was dead code → opportunistic stale-user
+  sweep past a size cap + accurate doc. Review CONFIRMED: case-folding, whole-word
+  boundaries, exemptions, action-mapping, guild isolation, no await-across-lock.
+  bot 10 + core 54 green; clippy unchanged (5 pre-existing).

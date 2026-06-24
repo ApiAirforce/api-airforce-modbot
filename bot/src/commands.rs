@@ -16,8 +16,8 @@ use serenity::all::{
 use airforce_modbot_core::link_filter::{normalize_host, UserChannelExempt, UserThreshold};
 use airforce_modbot_core::flood_filter::FloodUserOverride;
 use airforce_modbot_core::{
-    CaseAction, EscalationAction, FloodAction, FloodFilterConfig, FloodScope, JailConfig,
-    LinkFilterConfig, ModConfig,
+    AutomodAction, AutomodConfig, CaseAction, EscalationAction, FloodAction, FloodFilterConfig,
+    FloodScope, JailConfig, LinkFilterConfig, MatchMode, ModConfig,
 };
 use chrono::Utc;
 
@@ -173,6 +173,47 @@ pub fn command_defs() -> Vec<CreateCommand> {
                     .add_string_choice("ban", "ban"),
             )
             .add_option(int("timeout_minutes", "Timeout length when action = timeout")),
+        CreateCommand::new("automod")
+            .description("Configure content automod (only the options you pass change)")
+            .add_option(boolean("enabled", "Turn content automod on or off"))
+            .add_option(
+                string("action", "What to do on a trip")
+                    .add_string_choice("warn (delete + DM)", "warn")
+                    .add_string_choice("delete (+ strike)", "delete")
+                    .add_string_choice("delete + timeout", "timeout")
+                    .add_string_choice("delete + jail", "jail"),
+            )
+            .add_option(int("timeout_minutes", "Timeout length when action = timeout (1-40320)"))
+            .add_option(int("max_caps_ratio", "Trip at this % UPPERCASE (0 = off, else 1-100)"))
+            .add_option(int("min_caps_letters", "Only check caps on messages with >= N letters"))
+            .add_option(int("max_mentions", "Trip at this many mentions (0 = off)"))
+            .add_option(int("max_emojis", "Trip at this many emoji (0 = off)"))
+            .add_option(int("max_zalgo_ratio", "Trip at this % combining marks (0 = off, else 1-100)"))
+            .add_option(int("duplicate_threshold", "Trip at N identical messages in the window (0 = off)"))
+            .add_option(int("duplicate_window", "Duplicate window in seconds (1-3600)"))
+            .add_option(
+                string("match_mode", "How blocklist terms match")
+                    .add_string_choice("whole word", "word")
+                    .add_string_choice("substring", "substring")
+                    .add_string_choice("regex", "regex"),
+            )
+            .add_option(boolean("case_insensitive", "Match the blocklist case-insensitively"))
+            .add_option(boolean("warn_user", "DM the user when a message is removed")),
+        CreateCommand::new("blocklist")
+            .description("Manage the automod blocklist (banned words / patterns)")
+            .add_option(sub("add", "Add a blocked term/pattern").add_sub_option(string("term", "Word, substring, or regex (per match_mode)").required(true)))
+            .add_option(sub("remove", "Remove a blocked term").add_sub_option(string("term", "Exact entry to remove").required(true)))
+            .add_option(sub("list", "List blocked terms")),
+        CreateCommand::new("automodexempt")
+            .description("Add an automod exemption")
+            .add_option(sub("channel", "Never automod a whole channel").add_sub_option(chan("channel", "Channel").required(true)))
+            .add_option(sub("role", "Never automod holders of a role").add_sub_option(role("role", "Role").required(true)))
+            .add_option(sub("userchannel", "Don't automod a user in ONE channel").add_sub_option(user("user", "User").required(true)).add_sub_option(chan("channel", "Channel").required(true))),
+        CreateCommand::new("automodunexempt")
+            .description("Remove an automod exemption")
+            .add_option(sub("channel", "Re-enable automod in a channel").add_sub_option(chan("channel", "Channel").required(true)))
+            .add_option(sub("role", "Re-enable automod for a role").add_sub_option(role("role", "Role").required(true)))
+            .add_option(sub("userchannel", "Remove a per-(user, channel) exemption").add_sub_option(user("user", "User").required(true)).add_sub_option(chan("channel", "Channel").required(true))),
     ]
 }
 
@@ -292,6 +333,10 @@ pub async fn dispatch(ctx: &Context, cmd: &CommandInteraction, store: &RedbStore
         "case" => case_cmd(store, cmd, opts),
         "setmodlog" => set_modlog(store, &guild, opts),
         "setescalation" => set_escalation(store, &guild, opts),
+        "automod" => set_automod(store, &guild, opts),
+        "blocklist" => blocklist(store, &guild, opts),
+        "automodexempt" => automod_exempt(store, &guild, opts, true),
+        "automodunexempt" => automod_exempt(store, &guild, opts, false),
         other => Err(format!("unknown command /{other}")),
     };
 
@@ -320,7 +365,7 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
         FloodScope::Attachments => "attachments only",
         FloodScope::AttachmentsOrLinks => "attachments or links",
     };
-    format!(
+    let base = format!(
         "**Link filter** — {}\n\
          • guild: `{}`\n• threshold: {} • decay: {} days • warn DM: {}\n\
          • whitelist: {} domains • exempt channels: {} • exempt roles: {}\n\
@@ -366,6 +411,26 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
         fl.exempt_role_ids.len(),
         fl.exempt_user_channels.len(),
         fl.user_overrides.len(),
+    );
+    let am = AutomodConfig::load_for_guild(store, guild);
+    format!(
+        "{base}\n\n**Automod** — {}\n\
+         • blocklist: {} terms ({:?}) • caps: {}% (min {} letters) • mentions: {} • emoji: {} • zalgo: {}%\n\
+         • duplicate: {}/{}s • action: {:?} • exempt channels/roles/user-channels: {}/{}/{}",
+        on_off(am.enabled),
+        am.blocklist.len(),
+        am.match_mode,
+        am.max_caps_ratio,
+        am.min_caps_letters,
+        am.max_mentions,
+        am.max_emojis,
+        am.max_zalgo_ratio,
+        am.duplicate_threshold,
+        am.duplicate_window_secs,
+        am.action,
+        am.exempt_channel_ids.len(),
+        am.exempt_role_ids.len(),
+        am.exempt_user_channels.len(),
     )
 }
 
@@ -807,7 +872,7 @@ fn set_jail(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Resul
 
 /// Post a mod-log embed for a case to the configured channel (no-op if unset).
 #[allow(clippy::too_many_arguments)]
-async fn post_modlog(
+pub(crate) async fn post_modlog(
     ctx: &Context,
     store: &RedbStore,
     guild: &str,
@@ -1047,6 +1112,166 @@ fn set_escalation(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) ->
     mc.validate()?;
     mc.save_for_guild(store, guild)?;
     Ok(format!("✅ warn-escalation: {}", changed.join(", ")))
+}
+
+fn set_automod(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let mut a = AutomodConfig::load_for_guild(store, guild);
+    let mut changed = Vec::new();
+    if let Some(b) = get_bool(opts, "enabled") {
+        a.enabled = b;
+        changed.push(format!("enabled = {b}"));
+    }
+    if let Some(s) = get_str(opts, "action") {
+        a.action = match s.as_str() {
+            "warn" => AutomodAction::Warn,
+            "delete" => AutomodAction::Delete,
+            "timeout" => AutomodAction::Timeout,
+            "jail" => AutomodAction::Jail,
+            other => return Err(format!("invalid action `{other}`")),
+        };
+        changed.push(format!("action = {s}"));
+    }
+    if let Some(m) = get_int(opts, "timeout_minutes") {
+        a.timeout_minutes = m.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("timeout_minutes = {}", a.timeout_minutes));
+    }
+    if let Some(v) = get_int(opts, "max_caps_ratio") {
+        a.max_caps_ratio = v.clamp(0, 100) as u8;
+        changed.push(format!("max_caps_ratio = {}", a.max_caps_ratio));
+    }
+    if let Some(v) = get_int(opts, "min_caps_letters") {
+        a.min_caps_letters = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("min_caps_letters = {}", a.min_caps_letters));
+    }
+    if let Some(v) = get_int(opts, "max_mentions") {
+        a.max_mentions = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("max_mentions = {}", a.max_mentions));
+    }
+    if let Some(v) = get_int(opts, "max_emojis") {
+        a.max_emojis = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("max_emojis = {}", a.max_emojis));
+    }
+    if let Some(v) = get_int(opts, "max_zalgo_ratio") {
+        a.max_zalgo_ratio = v.clamp(0, 100) as u8;
+        changed.push(format!("max_zalgo_ratio = {}", a.max_zalgo_ratio));
+    }
+    if let Some(v) = get_int(opts, "duplicate_threshold") {
+        a.duplicate_threshold = v.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("duplicate_threshold = {}", a.duplicate_threshold));
+    }
+    if let Some(v) = get_int(opts, "duplicate_window") {
+        a.duplicate_window_secs = v.clamp(1, 3600) as u32;
+        changed.push(format!("duplicate_window = {}s", a.duplicate_window_secs));
+    }
+    if let Some(s) = get_str(opts, "match_mode") {
+        a.match_mode = match s.as_str() {
+            "word" => MatchMode::Word,
+            "substring" => MatchMode::Substring,
+            "regex" => MatchMode::Regex,
+            other => return Err(format!("invalid match_mode `{other}`")),
+        };
+        changed.push(format!("match_mode = {s}"));
+    }
+    if let Some(b) = get_bool(opts, "case_insensitive") {
+        a.case_insensitive = b;
+        changed.push(format!("case_insensitive = {b}"));
+    }
+    if let Some(b) = get_bool(opts, "warn_user") {
+        a.warn_user = b;
+        changed.push(format!("warn_user = {b}"));
+    }
+    if changed.is_empty() {
+        return Err("nothing to change — pass at least one option".into());
+    }
+    a.validate()?;
+    a.save_for_guild(store, guild)?;
+    Ok(format!("✅ automod updated: {}", changed.join(", ")))
+}
+
+fn blocklist(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result<String, String> {
+    let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
+    let mut a = AutomodConfig::load_for_guild(store, guild);
+    match sub {
+        "add" => {
+            let term = get_str(sopts, "term").ok_or("missing term")?.trim().to_string();
+            if term.is_empty() {
+                return Err("invalid term".into());
+            }
+            if a.blocklist.iter().any(|t| t == &term) {
+                return Ok(format!("`{term}` is already blocked"));
+            }
+            a.blocklist.push(term.clone());
+            a.validate()?; // rejects a non-compiling regex when match_mode = regex
+            a.save_for_guild(store, guild)?;
+            Ok(format!("✅ blocked `{term}`"))
+        }
+        "remove" => {
+            let term = get_str(sopts, "term").ok_or("missing term")?.trim().to_string();
+            let before = a.blocklist.len();
+            a.blocklist.retain(|t| t != &term);
+            if a.blocklist.len() == before {
+                return Ok(format!("`{term}` was not on the blocklist"));
+            }
+            a.save_for_guild(store, guild)?;
+            Ok(format!("✅ removed `{term}`"))
+        }
+        "list" => {
+            if a.blocklist.is_empty() {
+                Ok("the blocklist is empty".into())
+            } else {
+                Ok(format!("**Blocklist ({}):**\n{}", a.blocklist.len(), a.blocklist.join("\n")))
+            }
+        }
+        other => Err(format!("unknown subcommand {other}")),
+    }
+}
+
+fn automod_exempt(store: &RedbStore, guild: &str, opts: &[CommandDataOption], add: bool) -> Result<String, String> {
+    let (sub, sopts) = subcommand(opts).ok_or("missing subcommand")?;
+    let mut a = AutomodConfig::load_for_guild(store, guild);
+    let msg = match sub {
+        "channel" => {
+            let c = get_channel(sopts, "channel").ok_or("missing channel")?.get().to_string();
+            if add {
+                if !a.exempt_channel_ids.contains(&c) {
+                    a.exempt_channel_ids.push(c);
+                }
+                "channel exempted from automod"
+            } else {
+                a.exempt_channel_ids.retain(|x| x != &c);
+                "channel re-enabled for automod"
+            }
+        }
+        "role" => {
+            let r = get_role(sopts, "role").ok_or("missing role")?.get().to_string();
+            if add {
+                if !a.exempt_role_ids.contains(&r) {
+                    a.exempt_role_ids.push(r);
+                }
+                "role exempted from automod"
+            } else {
+                a.exempt_role_ids.retain(|x| x != &r);
+                "role re-enabled for automod"
+            }
+        }
+        "userchannel" => {
+            let u = get_user(sopts, "user").ok_or("missing user")?.get().to_string();
+            let c = get_channel(sopts, "channel").ok_or("missing channel")?.get().to_string();
+            if add {
+                if !a.exempt_user_channels.iter().any(|e| e.user_id == u && e.channel_id == c) {
+                    a.exempt_user_channels.push(UserChannelExempt { user_id: u, channel_id: c });
+                }
+                "user exempted in that channel"
+            } else {
+                a.exempt_user_channels.retain(|e| !(e.user_id == u && e.channel_id == c));
+                "per-(user, channel) exemption removed"
+            }
+        }
+        other => return Err(format!("unknown subcommand `{other}`")),
+    };
+    a.validate()?;
+    a.save_for_guild(store, guild)?;
+    Ok(format!("✅ {msg}"))
 }
 
 /// "case #N", or a clear note when the action happened but the case could not be
