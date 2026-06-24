@@ -12,6 +12,7 @@
 
 pub mod antinuke;
 pub mod automod;
+pub mod bulk_delete;
 pub mod cases;
 pub mod flood_filter;
 pub mod jail;
@@ -23,8 +24,11 @@ pub use antinuke::{ActionTracker, AntinukeConfig, DestructiveAction};
 pub use automod::{
     AutomodAction, AutomodConfig, AutomodVerdict, CompiledBlocklist, DuplicateTracker, MatchMode,
 };
+pub use bulk_delete::{plan_deletions, DeletionPlan};
 pub use cases::{Case, CaseAction, EscalationAction, ModConfig, WarnEscalation};
-pub use flood_filter::{FloodAction, FloodFilterConfig, FloodScope, FloodTracker, FloodVerdict};
+pub use flood_filter::{
+    flood_penalty_active, FloodAction, FloodFilterConfig, FloodScope, FloodTracker, FloodVerdict,
+};
 pub use jail::JailConfig;
 pub use link_filter::LinkFilterConfig;
 pub use ports::{ConfigStore, JailRecord, JailStore, LinkStrike, StrikeStore};

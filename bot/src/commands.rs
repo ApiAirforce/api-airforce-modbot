@@ -115,6 +115,8 @@ pub fn command_defs() -> Vec<CreateCommand> {
                     .add_string_choice("attachments only", "attachments")
                     .add_string_choice("attachments or links", "attachments_or_links"),
             )
+            .add_option(int("same_content_threshold", "Trip at N identical messages in the burst window (0 = off, else 2-100)"))
+            .add_option(int("trip_cooldown", "Keep deleting a tripped user for N secs (survives restart; 0 = off, max 3600)"))
             .add_option(role("jail_role", "Role to assign when action = jail"))
             .add_option(int("decay_days", "Days of no violations after which strikes reset (0 = never)"))
             .add_option(boolean("warn_user", "DM the user when their messages are removed")),
@@ -409,8 +411,8 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
          • role: `{}` • channel: `{}` • default: {} min • DM: {}\n\
          • currently jailed: {}\n\n\
          **Flood / raid filter** — {}\n\
-         • spread: {} channels / {}s • burst: {} msgs / {}s\n\
-         • action: {} • scope: {} • warn DM: {}\n\
+         • spread: {} channels / {}s • burst: {} msgs / {}s • identical: {} / burst window\n\
+         • action: {} • scope: {} • warn DM: {} • restart-cooldown: {}s\n\
          • exempt channels: {} • exempt roles: {} • per-user channel exemptions: {} • per-user limits: {}",
         on_off(f.enabled),
         empty_dash(&f.guild_id),
@@ -437,9 +439,11 @@ fn render_status(store: &RedbStore, guild: &str) -> String {
         fl.channel_window_secs,
         fl.msg_threshold,
         fl.msg_window_secs,
+        fl.same_content_threshold,
         flood_action,
         flood_scope,
         fl.warn_user,
+        fl.trip_cooldown_secs,
         fl.exempt_channel_ids.len(),
         fl.exempt_role_ids.len(),
         fl.exempt_user_channels.len(),
@@ -545,6 +549,14 @@ fn set_flood(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Resu
     if let Some(w) = get_int(opts, "msg_window") {
         f.msg_window_secs = w.clamp(0, u32::MAX as i64) as u32;
         changed.push(format!("msg_window = {}s", f.msg_window_secs));
+    }
+    if let Some(t) = get_int(opts, "same_content_threshold") {
+        f.same_content_threshold = t.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("same_content_threshold = {}", f.same_content_threshold));
+    }
+    if let Some(w) = get_int(opts, "trip_cooldown") {
+        f.trip_cooldown_secs = w.clamp(0, u32::MAX as i64) as u32;
+        changed.push(format!("trip_cooldown = {}s", f.trip_cooldown_secs));
     }
     if let Some(a) = get_str(opts, "action") {
         f.action = match a.as_str() {
@@ -871,6 +883,8 @@ fn strikes(store: &RedbStore, guild: &str, opts: &[CommandDataOption]) -> Result
         "reset" => {
             let u = get_user(sopts, "user").ok_or("missing user")?.get().to_string();
             store.reset_link_strikes_in(guild, &u)?;
+            // Releasing a user also lifts any persisted flood penalty box.
+            let _ = store.clear_flood_trip_in(guild, &u);
             Ok(format!("✅ cleared strikes for <@{u}>"))
         }
         other => Err(format!("unknown subcommand {other}")),
@@ -892,6 +906,8 @@ async fn unjail_cmd(ctx: &Context, store: &RedbStore, cmd: &CommandInteraction, 
     let target = get_user(opts, "user").ok_or("missing user")?;
     let by = cmd.user.id.to_string();
     jail::unjail_member(ctx, store, guild_id, target, &by).await?;
+    // Releasing a user also lifts any persisted flood penalty box.
+    let _ = store.clear_flood_trip_in(&guild_id.get().to_string(), &target.get().to_string());
     Ok(format!("🔓 released <@{}> and restored their roles", target.get()))
 }
 

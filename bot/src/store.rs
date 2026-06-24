@@ -272,6 +272,34 @@ impl RedbStore {
         v
     }
 
+    // ── flood penalty (persisted "recently tripped" memory) ──────────────────
+    // Stored in CONFIG under "flood_trip:{guild}:{user}" so it survives a restart
+    // (the in-RAM sliding window does not). Lets the host keep deleting an
+    // in-progress raider's messages for a cooldown after a restart, instead of
+    // instantly forgiving them. See `flood_filter::flood_penalty_active`.
+
+    fn flood_trip_key(guild_id: &str, user_id: &str) -> String {
+        format!("flood_trip:{}", gkey(guild_id, user_id))
+    }
+
+    /// Record that a user tripped the flood filter in a guild at `now_unix`.
+    pub fn record_flood_trip_in(&self, guild_id: &str, user_id: &str, now_unix: i64) -> Result<(), String> {
+        self.put_str(CONFIG, &Self::flood_trip_key(guild_id, user_id), &now_unix.to_string())
+    }
+
+    /// The last time a user tripped the flood filter in a guild, if recorded.
+    pub fn recent_flood_trip_in(&self, guild_id: &str, user_id: &str) -> Option<i64> {
+        self.get_str(CONFIG, &Self::flood_trip_key(guild_id, user_id))
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Clear a user's persisted flood-trip (lifts the penalty box). Called when an
+    /// admin releases them (`/unjail`, `/strikes reset`) and opportunistically by
+    /// the host once a trip has expired, so the rows can't accumulate. Idempotent.
+    pub fn clear_flood_trip_in(&self, guild_id: &str, user_id: &str) -> Result<(), String> {
+        self.del_key(CONFIG, &Self::flood_trip_key(guild_id, user_id))
+    }
+
     // ── cases (mod-log / case system) ────────────────────────────────────────
 
     /// Record a moderation case, assigning the next **per-guild** case number
@@ -632,6 +660,24 @@ mod tests {
         assert_eq!(s.get_jail_in("g1", "u").unwrap().prior_roles, vec!["r1".to_string()]);
         s.remove_jail_in("g1", "u").unwrap();
         assert!(s.get_jail_in("g1", "u").is_none());
+    }
+
+    #[test]
+    fn flood_trip_memory_roundtrips_and_is_guild_scoped() {
+        let ts = TempStore::new("floodtrip");
+        let s = &ts.store;
+        assert!(s.recent_flood_trip_in("g1", "u").is_none());
+        s.record_flood_trip_in("g1", "u", 12_345).unwrap();
+        assert_eq!(s.recent_flood_trip_in("g1", "u"), Some(12_345));
+        // same user, different guild => independent
+        assert!(s.recent_flood_trip_in("g2", "u").is_none());
+        // refresh overwrites
+        s.record_flood_trip_in("g1", "u", 99_999).unwrap();
+        assert_eq!(s.recent_flood_trip_in("g1", "u"), Some(99_999));
+        // clearing lifts the penalty box (and frees the row); idempotent
+        s.clear_flood_trip_in("g1", "u").unwrap();
+        assert!(s.recent_flood_trip_in("g1", "u").is_none());
+        s.clear_flood_trip_in("g1", "u").unwrap();
     }
 
     #[test]

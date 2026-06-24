@@ -30,9 +30,13 @@ community Discord and is open source so anyone can run it.
   subdomains only), tolerant of pasted `https://`/`www.`/paths.
 - Strike counting with optional decay; per-user and per-(user, channel)
   exemptions; whole-channel and whole-role exemptions; per-user strike limits.
-- Cross-channel flood/raid detection with a per-user sliding window (in memory,
-  bounded to active posters), dual triggers, configurable action and scope, and
-  the same exemption/per-user-override surface as the link filter.
+- Cross-channel flood/raid detection with a per-user sliding window (bounded to
+  active posters), three triggers (channel-spread, burst, and an optional
+  identical-content rule), configurable action and scope, and the same
+  exemption/per-user-override surface as the link filter. Bursts are removed with
+  Discord's **bulk-delete** (single-delete fallback for stragglers), and a
+  restart no longer instantly forgives an in-progress raider (optional persisted
+  cooldown).
 - Escape-proof role-snapshot jail with timed or indefinite sentences and an
   automatic expiry sweep.
 - Standard mod toolkit: ban / kick / native timeout / warn with **auto-escalation**
@@ -72,12 +76,15 @@ In the **Bot** tab, under **Privileged Gateway Intents**, enable:
 Use this URL (replace `YOUR_APP_ID` with your application's Client ID):
 
 ```text
-https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=268512256
+https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=1099780140166
 ```
 
-`268512256` grants the permissions the bot needs: **View Channels**, **Send
-Messages**, **Manage Messages** (delete ads), **Read Message History**, and
-**Manage Roles** (the jail).
+`1099780140166` grants the permissions the full toolkit needs: **View
+Channels**, **Send Messages**, **Manage Messages** (delete ads + bulk-delete
+floods), **Read Message History**, **Manage Roles** (the jail + anti-nuke
+strip), **Kick Members**, **Ban Members**, **Timeout Members** (the mod
+actions), and **View Audit Log** (anti-nuke). If you only want the link filter +
+jail, the narrower `268512256` (the first five) is enough.
 
 ### 4. Set up the Jail role
 
@@ -145,7 +152,7 @@ That's it — non-whitelisted links now get removed and repeat offenders jailed.
 | `/jail` | Restrict a member (`user`, optional `minutes`, `reason`) |
 | `/unjail` | Release a member and restore their roles |
 | `/setjail` | Set `enabled`, `role`, `channel`, `default_minutes` |
-| `/setflood` | Configure the flood/raid filter: `enabled`, `channel_threshold`, `channel_window`, `msg_threshold`, `msg_window`, `action`, `scope`, `jail_role`, `decay_days`, `warn_user` (only what you pass) |
+| `/setflood` | Configure the flood/raid filter: `enabled`, `channel_threshold`, `channel_window`, `msg_threshold`, `msg_window`, `same_content_threshold`, `trip_cooldown`, `action`, `scope`, `jail_role`, `decay_days`, `warn_user` (only what you pass) |
 | `/floodexempt channel\|role\|userchannel` | Add a flood-filter exemption |
 | `/floodunexempt channel\|role\|userchannel` | Remove a flood-filter exemption |
 | `/floodlimit` | Set per-user flood thresholds (`channel_threshold`, `msg_threshold`; 0 inherits) |

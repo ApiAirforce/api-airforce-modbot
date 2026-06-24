@@ -705,6 +705,24 @@ impl Handler {
             return false;
         }
 
+        // Persisted penalty box: if this user tripped recently (a memory that
+        // survives a restart, unlike the in-RAM window), keep deleting their
+        // counting messages for the cooldown — no new strike/case spam, just a
+        // silent continuation so a restart mid-raid doesn't forgive an
+        // in-progress raider. Config-gated (default off).
+        if cfg.trip_cooldown_secs > 0 {
+            if let Some(trip_at) = self.store.recent_flood_trip_in(&msg_guild, &author_id) {
+                if airforce_modbot_core::flood_penalty_active(trip_at, Utc::now().timestamp(), cfg.trip_cooldown_secs) {
+                    let _ = message.channel_id.delete_message(&ctx.http, message.id).await;
+                    // Refresh so a still-posting raider stays boxed (sliding).
+                    let _ = self.store.record_flood_trip_in(&msg_guild, &author_id, Utc::now().timestamp());
+                    return true;
+                }
+                // Expired: free the persisted row so trip records can't accumulate.
+                let _ = self.store.clear_flood_trip_in(&msg_guild, &author_id);
+            }
+        }
+
         // Monotonic process clock (ms). Serenity's Timestamp is `time`-based; a
         // steady local clock is all the sliding window needs.
         let now_ms = {
@@ -719,10 +737,11 @@ impl Handler {
         // Hold the lock ONLY for record/evaluate — never across an await below.
         let verdict = {
             let mut tracker = self.flood_tracker.lock().unwrap();
-            tracker.record_and_check(
+            tracker.record_and_check_content(
                 &flood_key,
                 &channel_id,
                 &message.id.get().to_string(),
+                Some(message.content.as_str()),
                 now_ms,
                 &cfg,
                 ch_thr,
@@ -733,9 +752,43 @@ impl Handler {
             return false;
         };
 
-        // 1) bulk-delete the burst across channels.
+        // 1) Delete the burst: Discord bulk-delete (2..=100 recent ids per
+        //    channel) with a single-delete fallback for stragglers and on any
+        //    bulk-delete error (e.g. a message that slipped past the 14-day check
+        //    or a transient 429).
         let mut deleted = 0u32;
-        for (cid, mid) in &v.messages_to_delete {
+        let now_ms_wall = Utc::now().timestamp_millis().max(0) as u64;
+        let plan = airforce_modbot_core::plan_deletions(&v.messages_to_delete, now_ms_wall);
+        for (cid, ids) in &plan.bulk {
+            let Ok(c) = cid.parse::<u64>() else { continue };
+            let chan = serenity::all::ChannelId::new(c);
+            let mids: Vec<serenity::all::MessageId> = ids
+                .iter()
+                .filter_map(|m| m.parse::<u64>().ok())
+                .map(serenity::all::MessageId::new)
+                .collect();
+            if mids.len() < 2 {
+                // Parsing dropped the batch below the bulk minimum — delete singly.
+                for m in &mids {
+                    if chan.delete_message(&ctx.http, *m).await.is_ok() {
+                        deleted += 1;
+                    }
+                }
+                continue;
+            }
+            match chan.delete_messages(&ctx.http, mids.iter().copied()).await {
+                Ok(()) => deleted += mids.len() as u32,
+                Err(e) => {
+                    eprintln!("⚠️ flood-filter: bulk-delete in channel {cid} failed ({e}); retrying individually");
+                    for m in &mids {
+                        if chan.delete_message(&ctx.http, *m).await.is_ok() {
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for (cid, mid) in &plan.single {
             if let (Ok(c), Ok(m)) = (cid.parse::<u64>(), mid.parse::<u64>()) {
                 if serenity::all::ChannelId::new(c)
                     .delete_message(&ctx.http, serenity::all::MessageId::new(m))
@@ -751,6 +804,11 @@ impl Handler {
             .store
             .record_link_strike_in(&msg_guild, &author_id, &v.reason, Utc::now().timestamp(), cfg.decay_days)
             .unwrap_or(0);
+        // Persist the trip so a restart mid-raid keeps deleting this user's
+        // messages for the cooldown (config-gated; default off).
+        if cfg.trip_cooldown_secs > 0 {
+            let _ = self.store.record_flood_trip_in(&msg_guild, &author_id, Utc::now().timestamp());
+        }
         println!(
             "🌊 flood-filter: {} — removed {deleted} msg(s) from {author_id} (strike {new_count})",
             v.reason

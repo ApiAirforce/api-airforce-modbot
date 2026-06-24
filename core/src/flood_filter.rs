@@ -113,6 +113,14 @@ pub struct FloodFilterConfig {
     #[serde(default = "d_msg_window")]
     pub msg_window_secs: u32,
 
+    /// Same-content rule: also trip when this many IDENTICAL (whitespace- and
+    /// case-normalized) messages land within `msg_window_secs`, regardless of how
+    /// many channels they span. `0` (default) disables it — preserving current
+    /// behavior. Needs the host to pass message content (the multi-guild bot
+    /// does, via [`FloodTracker::record_and_check_content`]).
+    #[serde(default)]
+    pub same_content_threshold: u32,
+
     /// What happens on a trip.
     #[serde(default = "d_action")]
     pub action: FloodAction,
@@ -127,6 +135,13 @@ pub struct FloodFilterConfig {
     /// Strike decay window in days for flood strikes (`0` => never expire).
     #[serde(default)]
     pub decay_days: u32,
+    /// Post-trip penalty window in seconds. The host persists each trip, so a bot
+    /// restart mid-raid doesn't instantly forgive an in-progress raider: while
+    /// the window is active the user's counting messages keep getting deleted
+    /// (no new strike or case). `0` (default) disables it. See
+    /// [`flood_penalty_active`].
+    #[serde(default)]
+    pub trip_cooldown_secs: u32,
     /// DM the user a notice on a trip.
     #[serde(default = "d_true")]
     pub warn_user: bool,
@@ -155,10 +170,12 @@ impl Default for FloodFilterConfig {
             channel_window_secs: d_channel_window(),
             msg_threshold: d_msg_threshold(),
             msg_window_secs: d_msg_window(),
+            same_content_threshold: 0,
             action: d_action(),
             scope: d_scope(),
             jail_role_id: String::new(),
             decay_days: 0,
+            trip_cooldown_secs: 0,
             warn_user: true,
             exempt_channel_ids: Vec::new(),
             exempt_role_ids: Vec::new(),
@@ -219,6 +236,12 @@ impl FloodFilterConfig {
         if self.msg_threshold != 0 && !(2..=100).contains(&self.msg_threshold) {
             return Err("msg_threshold must be 0 (off) or between 2 and 100".into());
         }
+        if self.same_content_threshold != 0 && !(2..=100).contains(&self.same_content_threshold) {
+            return Err("same_content_threshold must be 0 (off) or between 2 and 100".into());
+        }
+        if self.trip_cooldown_secs > 3600 {
+            return Err("trip_cooldown_secs must be 0 (off) .. 3600".into());
+        }
         if !(1..=3600).contains(&self.channel_window_secs) {
             return Err("channel_window_secs must be between 1 and 3600".into());
         }
@@ -276,12 +299,38 @@ impl FloodFilterConfig {
     }
 }
 
+/// Whether a user is still inside their post-trip flood penalty window. The host
+/// persists the trip time (so it survives a restart) and passes it back here;
+/// `cooldown_secs == 0` disables the feature. Pure — the host supplies both the
+/// persisted trip time and the current time.
+pub fn flood_penalty_active(trip_unix: i64, now_unix: i64, cooldown_secs: u32) -> bool {
+    cooldown_secs > 0 && now_unix >= trip_unix && (now_unix - trip_unix) < cooldown_secs as i64
+}
+
+/// Fingerprint message text for the same-content rule: trim, collapse internal
+/// whitespace runs to single spaces, lowercase, then hash. Returns `None` for
+/// content that is empty after normalization (blank / attachment-only messages),
+/// so those never count as "identical" to one another.
+fn content_fingerprint(content: &str) -> Option<u64> {
+    let norm = content.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    norm.hash(&mut h);
+    Some(h.finish())
+}
+
 /// One recorded message in the sliding window.
 #[derive(Debug, Clone)]
 struct FloodEvent {
     channel_id: String,
     message_id: String,
     at_ms: u64,
+    /// Fingerprint of the normalized content for the same-content rule, or `None`
+    /// when the host didn't supply content (or it was blank).
+    content_hash: Option<u64>,
 }
 
 /// The outcome of a trip: the messages to delete (across channels) and a human
@@ -308,11 +357,15 @@ impl FloodTracker {
     }
 
     /// Record one *counting* message (the host must already have applied
-    /// `scope` + exemptions) and evaluate both rules. Returns a [`FloodVerdict`]
+    /// `scope` + exemptions) and evaluate the rules. Returns a [`FloodVerdict`]
     /// when the user tripped — and in that case the user's window is cleared so
     /// the same burst is not re-reported on the next message.
     ///
     /// `now_ms` is a monotonic millisecond clock (tests pass synthetic values).
+    /// This content-free entry point keeps the original signature stable for the
+    /// single-guild api.airforce backend; the same-content rule never fires
+    /// through it (no content). Multi-guild hosts call
+    /// [`Self::record_and_check_content`].
     pub fn record_and_check(
         &mut self,
         user_id: &str,
@@ -323,14 +376,45 @@ impl FloodTracker {
         channel_threshold: u32,
         msg_threshold: u32,
     ) -> Option<FloodVerdict> {
+        self.record_and_check_content(
+            user_id,
+            channel_id,
+            message_id,
+            None,
+            now_ms,
+            cfg,
+            channel_threshold,
+            msg_threshold,
+        )
+    }
+
+    /// As [`Self::record_and_check`] but also evaluates the optional same-content
+    /// rule: `content` is the raw message text (the host supplies it). When
+    /// `cfg.same_content_threshold >= 2`, N identical (normalized) messages in the
+    /// burst window trip the filter even with no channel spread. `content == None`
+    /// (or blank) makes this behave exactly like the content-free path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_and_check_content(
+        &mut self,
+        user_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        content: Option<&str>,
+        now_ms: u64,
+        cfg: &FloodFilterConfig,
+        channel_threshold: u32,
+        msg_threshold: u32,
+    ) -> Option<FloodVerdict> {
         let horizon_secs = cfg.channel_window_secs.max(cfg.msg_window_secs) as u64;
         let horizon_ms = horizon_secs.saturating_mul(1000);
 
+        let this_hash = content.and_then(content_fingerprint);
         let dq = self.by_user.entry(user_id.to_string()).or_default();
         dq.push_back(FloodEvent {
             channel_id: channel_id.to_string(),
             message_id: message_id.to_string(),
             at_ms: now_ms,
+            content_hash: this_hash,
         });
         // Prune everything older than the widest window we care about.
         let cutoff = now_ms.saturating_sub(horizon_ms);
@@ -364,6 +448,23 @@ impl FloodTracker {
                     "flood: {} messages in {}s",
                     count, cfg.msg_window_secs
                 ));
+            }
+        }
+        // Same-content rule: N identical (normalized) messages in the burst window,
+        // independent of channel spread. Opt-in (default off).
+        if tripped.is_none() && cfg.same_content_threshold >= 2 {
+            if let Some(h) = this_hash {
+                let ms_cutoff = now_ms.saturating_sub((cfg.msg_window_secs as u64) * 1000);
+                let same = dq
+                    .iter()
+                    .filter(|e| e.at_ms >= ms_cutoff && e.content_hash == Some(h))
+                    .count() as u32;
+                if same >= cfg.same_content_threshold {
+                    tripped = Some(format!(
+                        "flood: {same} identical messages in {}s",
+                        cfg.msg_window_secs
+                    ));
+                }
             }
         }
 
@@ -530,5 +631,83 @@ mod tests {
         // leaving exactly the new one (still 1 tracked, not a trip)
         assert!(rec(&mut t, &c, "u", "c1", "m2", 100_000).is_none());
         assert_eq!(t.tracked_users(), 1);
+    }
+
+    #[test]
+    fn same_content_rule_trips_independent_of_channel_spread() {
+        // Disable spread + burst so ONLY the same-content rule can fire.
+        let mut c = cfg();
+        c.channel_threshold = 0;
+        c.msg_threshold = 0;
+        c.same_content_threshold = 3;
+        let mut t = FloodTracker::new();
+        // 3 identical messages (modulo case/whitespace), all in ONE channel.
+        assert!(t.record_and_check_content("u", "c1", "m1", Some("Buy  CHEAP nitro"), 0, &c, 0, 0).is_none());
+        assert!(t.record_and_check_content("u", "c1", "m2", Some("buy cheap nitro"), 500, &c, 0, 0).is_none());
+        let v = t
+            .record_and_check_content("u", "c1", "m3", Some("BUY   cheap   nitro"), 900, &c, 0, 0)
+            .expect("3 identical messages trip the same-content rule");
+        assert!(v.reason.contains("identical"));
+        assert_eq!(v.messages_to_delete.len(), 3);
+    }
+
+    #[test]
+    fn same_content_rule_ignores_distinct_text_and_is_off_by_default() {
+        let mut c = cfg();
+        c.channel_threshold = 0;
+        c.msg_threshold = 0;
+        c.same_content_threshold = 3;
+        let mut t = FloodTracker::new();
+        // Different text each time => never trips even at 3 messages.
+        assert!(t.record_and_check_content("u", "c1", "m1", Some("hello"), 0, &c, 0, 0).is_none());
+        assert!(t.record_and_check_content("u", "c1", "m2", Some("world"), 100, &c, 0, 0).is_none());
+        assert!(t.record_and_check_content("u", "c1", "m3", Some("again"), 200, &c, 0, 0).is_none());
+        // With the rule OFF (threshold 0), 3 identical messages do NOT trip.
+        c.same_content_threshold = 0;
+        let mut t2 = FloodTracker::new();
+        assert!(t2.record_and_check_content("u", "c1", "m1", Some("spam"), 0, &c, 0, 0).is_none());
+        assert!(t2.record_and_check_content("u", "c1", "m2", Some("spam"), 1, &c, 0, 0).is_none());
+        assert!(t2.record_and_check_content("u", "c1", "m3", Some("spam"), 2, &c, 0, 0).is_none());
+    }
+
+    #[test]
+    fn blank_content_never_counts_as_identical() {
+        let mut c = cfg();
+        c.channel_threshold = 0;
+        c.msg_threshold = 0;
+        c.same_content_threshold = 2;
+        let mut t = FloodTracker::new();
+        // Attachment-only / whitespace messages have no fingerprint => never match.
+        assert!(t.record_and_check_content("u", "c1", "m1", Some("   "), 0, &c, 0, 0).is_none());
+        assert!(t.record_and_check_content("u", "c1", "m2", Some(""), 1, &c, 0, 0).is_none());
+    }
+
+    #[test]
+    fn flood_penalty_active_respects_cooldown_and_off_switch() {
+        // off when cooldown is 0
+        assert!(!flood_penalty_active(100, 100, 0));
+        // inside the window
+        assert!(flood_penalty_active(100, 130, 60));
+        // exactly at the edge is no longer active (< not <=)
+        assert!(!flood_penalty_active(100, 160, 60));
+        // past the window
+        assert!(!flood_penalty_active(100, 500, 60));
+        // a clock that went backwards never counts as active
+        assert!(!flood_penalty_active(100, 90, 60));
+    }
+
+    #[test]
+    fn validate_rejects_new_footguns() {
+        let mut c = cfg();
+        c.same_content_threshold = 1; // below the min-2 floor
+        assert!(c.validate().is_err());
+        let mut c2 = cfg();
+        c2.trip_cooldown_secs = 4000; // over the 3600 cap
+        assert!(c2.validate().is_err());
+        // valid combinations pass
+        let mut ok = cfg();
+        ok.same_content_threshold = 3;
+        ok.trip_cooldown_secs = 120;
+        assert!(ok.validate().is_ok());
     }
 }

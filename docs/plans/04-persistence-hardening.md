@@ -3,10 +3,24 @@
 **Goal:** close the correctness gaps the benchmark flagged in what we *already*
 ship, so the existing features are production-solid before/while we add more.
 
-**Status:** ☐ todo · **Effort:** ~1–2 d · **Depends on:** Plan 00 (guild-keyed
-flood state). Can interleave early — it hardens shipped code.
+**Status:** ◐ code + adversarial review done (mergebar, 0 blocker; 1 low fixed —
+flood-trip admin escape-hatch + bounded growth); staging-verify pending ·
+**Effort:** ~1–2 d · **Depends on:** Plan 00 (guild-keyed flood state). Can
+interleave early — it hardens shipped code.
+
+> Implemented: (1) pure `core/bulk_delete.rs` `plan_deletions` partitions a burst
+> into Discord bulk-delete batches (2..=100, <14 d) + single-delete stragglers;
+> the bot uses it with a single-delete fallback on any bulk error. (2) opt-in
+> `same_content_threshold` identical-content trigger in `flood_filter` (additive
+> `record_and_check_content`; the original `record_and_check` is an unchanged
+> delegating wrapper, so the single-guild backend is untouched). (3) persisted
+> "recent-trip" memory (`record_flood_trip_in`/`recent_flood_trip_in` +
+> `flood_penalty_active`), config-gated by `trip_cooldown_secs` (default off), so
+> a restart mid-raid keeps deleting an in-progress raider. (4) README invite
+> bitmask recomputed (`1099780140166`) to cover kick/ban/timeout/audit-log.
 
 ## Gaps (from benchmark — our own bot)
+
 1. **Flood window is in-RAM only** → a restart mid-raid wipes the sliding-window
    state (strikes/jails persist; the live tracker doesn't).
 2. **Bulk-deletes are naive** — flood deletes loop single `delete_message` calls,
@@ -18,6 +32,7 @@ flood state). Can interleave early — it hardens shipped code.
    undocumented; invite-permission bitmask mismatch).
 
 ## Design / Phases
+
 1. **Bulk-delete hardening** (`bot/handler.rs`): collect the burst's message ids
    per channel and use the channel **bulk-delete** endpoint (≤100, <14 days old)
    with a single-delete fallback for older stragglers; add rate-limit-aware
@@ -37,13 +52,17 @@ flood state). Can interleave early — it hardens shipped code.
    perms (or list the perms the bitmask actually grants). Pure docs.
 
 ## Definition of done
-- [ ] Burst deletion uses bulk-delete + backoff; verified on staging (no 429
-      storm, whole burst removed).
-- [ ] Identical-content trigger unit-tested, default-off.
-- [ ] Restart no longer instantly forgives an in-progress raider (chosen
-      mechanism documented + tested).
-- [ ] README accurate (command count, undocumented commands, permission bitmask).
+
+- [x] Burst deletion uses bulk-delete + single-delete fallback (helper
+      unit-tested); staging-verify of the live path still pending.
+- [x] Identical-content trigger unit-tested, default-off.
+- [x] Restart no longer instantly forgives an in-progress raider (persisted
+      trip-memory + `flood_penalty_active`, config-gated; documented + tested).
+- [x] README accurate (33 commands; `/allowinvite` `/allowserver` documented;
+      permission bitmask recomputed to match the listed perms).
 
 ## Risks
+
 - Bulk-delete API rejects messages >14 days old → must fall back to single
-  delete for those (flood bursts are seconds old, so rarely an issue).
+  delete for those (flood bursts are seconds old, so rarely an issue). Handled:
+  `plan_deletions` routes >14-day ids to the single path by snowflake age.

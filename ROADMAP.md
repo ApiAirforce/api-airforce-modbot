@@ -45,7 +45,7 @@
 | **01** | [Mod-Action Suite](docs/plans/01-mod-action-suite.md) | No ban/kick/timeout/warn, no mod-log/cases | ~2–3 d | ◐ code+review done; staging-verify pending |
 | **02** | [Content Automod](docs/plans/02-content-automod.md) | No word/regex/caps/mention/zalgo/dup filters | ~3–4 d | ◐ code+review done; staging-verify pending |
 | **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ◐ code+review done (4 findings fixed); staging-verify pending |
-| **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ☐ |
+| **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ◐ code+review done (1 low fixed); staging-verify pending |
 | **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ☐ later |
 | **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ☐ later |
 | **90** | [Community Breadth (backlog)](docs/plans/90-backlog-community.md) | Leveling/reaction-roles/welcome/tickets/… | ~10–14 d | ⏸ backlog |
@@ -174,3 +174,36 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
   burst counter + raised the default threshold 5→10; `/setantinuke` now nudges to
   dry-run first when going live. **bot 10 + core 64 green**, clippy still the 5
   pre-existing warnings (zero new). Pending: staging test.
+- *2026-06-24* — **Plan 03 committed** (`cd629d1`, explicit paths, no AI
+  attribution).
+- *2026-06-24* — **Plan 04 (Persistence & Hardening), code-complete.**
+  (1) New pure `core/bulk_delete.rs` — `plan_deletions` partitions a burst into
+  Discord **bulk-delete** batches (per channel, 2..=100, <14 d by snowflake age)
+  plus single-delete stragglers; the flood path now bulk-deletes with a
+  single-delete fallback on any error (replaces the per-message delete loop).
+  (2) **Identical-content** trigger in `flood_filter` (`same_content_threshold`,
+  opt-in/default-off) via an additive `record_and_check_content`; the original
+  `record_and_check` is an unchanged delegating wrapper → the single-guild
+  api.airforce backend stays byte-compatible. (3) **Persisted trip-memory**:
+  `record_flood_trip_in`/`recent_flood_trip_in` (redb CONFIG, guild-scoped) +
+  pure `flood_penalty_active`, config-gated by `trip_cooldown_secs` (default
+  off) — a restart mid-raid keeps deleting an in-progress raider without
+  re-strike spam. (4) **README** invite bitmask recomputed `268512256` →
+  `1099780140166` (adds kick/ban/timeout/audit-log for Plans 01/03); `/setflood`
+  gains the two new knobs + `/modstatus` shows them. **bot 11 + core 74 green**
+  (+1 store, +10 core tests), clippy still the 5 pre-existing warnings (zero
+  new). Pending: Plan 04 review + staging test.
+- *2026-06-24* — **Plan 04 adversarial review (2 lenses + synthesis) → mergebar,
+  0 blocker.** Regression/extension guarantee confirmed: the old `record_and_check`
+  (content=None) can never reach the same-content branch, so the single-guild
+  backend path is observably unchanged; `plan_deletions` batches strictly 2..=100,
+  14-day boundary `<`, no message dropped; no await across the tracker lock; the
+  `flood_trip:` key can't collide with config/`case_seq:` keys and CONFIG is never
+  iterated by migration/`all_values`. **1 low fixed**: the penalty box had no
+  admin escape-hatch and its rows grew write-only — added
+  `RedbStore::clear_flood_trip_in`, called from `/unjail` + `/strikes reset`
+  (release lifts the box) and opportunistically when a trip has expired (bounds
+  growth). (The 2nd low — Discord-side `min/max_int_value` on the new `/setflood`
+  ints — left for parity with the existing 8 int options that also rely on
+  `validate()`.) **bot 11 + core 74 still green**, clippy zero new. Pending:
+  staging test.
