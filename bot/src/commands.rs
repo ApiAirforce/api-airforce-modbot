@@ -69,7 +69,7 @@ pub fn command_defs() -> Vec<CreateCommand> {
             .add_option(user("user", "User").required(true))
             .add_option(int("threshold", "Their threshold (1-20), or 0 to remove the override").required(true)),
         CreateCommand::new("allowinvite")
-            .description("Allow specific Discord invite codes (yours + partners); others are blocked when the invite filter is on")
+            .description("Allow specific Discord invite codes; others are blocked when the invite filter is on")
             .add_option(sub("add", "Allow a Discord invite code").add_sub_option(string("code", "The part after discord.gg/ , e.g. airforce").required(true)))
             .add_option(sub("remove", "Remove an allowed invite code").add_sub_option(string("code", "Exact code to remove").required(true)))
             .add_option(sub("list", "List allowed invite codes")),
