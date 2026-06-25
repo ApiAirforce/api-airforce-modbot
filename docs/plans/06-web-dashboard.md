@@ -4,8 +4,13 @@
 Discord OAuth login, pick a server you manage, edit every per-guild setting that
 today lives behind slash commands, view cases/strikes/jails.
 
-**Status:** ◐ v1 code + security review done (mergebar, 0 blocker; 5 low/med
-fixed); server/auth live-smoke verified; full OAuth-callback test pending ·
+**Status:** ✅ v1 done — security review (mergebar, 0 blocker; 5 low/med fixed)
+**and** full OAuth-callback live test passed end-to-end (real Discord app: login
+→ pick server → edit a setting → persisted; foreign-guild GET/PUT → 403, unknown
+section → 404, no-session → 401). The live test caught one real bug — the
+callback set two `Set-Cookie` headers via a `[(K,V); N]` array, whose
+`IntoResponseParts` impl *inserts* (overwrites) per key, so the state-clearing
+cookie clobbered the session cookie → fixed with `AppendHeaders` (appends). ·
 **Effort:** ~5–10 d · **Depends on:** Plan 00 (per-guild config is the data the
 dashboard edits). Largest single item — effectively a small app.
 

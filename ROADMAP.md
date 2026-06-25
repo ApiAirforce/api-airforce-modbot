@@ -47,7 +47,7 @@
 | **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ◐ code+review done (4 findings fixed); staging-verify pending |
 | **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ◐ code+review done (1 low fixed); staging-verify pending |
 | **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ◐ P1–3 code+review done (1 low fixed; mock-tested, no spend); live staging pending |
-| **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ◐ v1 code+review done (mergebar, 0 blocker; 5 low/med fixed); server/auth live-verified; full OAuth-callback test pending |
+| **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ✅ v1 done — review (mergebar, 0 blocker; 5 low/med fixed) **+** full OAuth-callback live test passed (real Discord app; login→edit→persist; auth gates 403/404/401). Caught + fixed one cookie bug (`AppendHeaders`) |
 | **90** | [Community Breadth (backlog)](docs/plans/90-backlog-community.md) | Leveling/reaction-roles/welcome/tickets/… | ~10–14 d | ⏸ backlog |
 
 **Phase-1 commitment (Moderation-Vollausbau): Plans 00 → 04.** ≈ 3–4 focused
@@ -281,3 +281,21 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
   ~200-guild single-page fetch (under-grant only); (L) `esc()` two app.js sinks
   (defense-in-depth). **bot 22 + core 80 still green**, clippy zero new. Pending:
   full OAuth-callback live test (needs real OAuth creds).
+- *2026-06-25* — **Plan 06 committed** (`4269ee3`, explicit paths, no AI
+  attribution).
+- *2026-06-25* — **Plan 06 full OAuth-callback live test (Browser MCP, real
+  Discord app) → PASSED.** Registered the `http://127.0.0.1:8099/api/callback`
+  redirect + reset the OAuth client secret in the Dev Portal, ran the bot with
+  `[dashboard]` enabled, and drove the whole flow: login page → `/api/login` →
+  Discord consent (exactly `identify`+`guilds`) → callback → session →
+  logged-in SPA → edited Link-filter strike threshold 3→5 → **persisted**
+  (verified via re-GET + the `dashboard: link config … updated` server log, same
+  store the slash commands write). Auth gates confirmed live: foreign-guild
+  GET **and** PUT → 403, unknown section → 404, no session → 401. The store is
+  shared bidirectionally (AI config set earlier via `/setai` showed up in the
+  dashboard GET). **One real bug caught by the live run** (invisible to unit
+  tests + review): the callback returned two `Set-Cookie` headers via a
+  `[(K,V); N]` array, whose `IntoResponseParts` impl *inserts* (overwrites) per
+  header name, so the state-clearing cookie clobbered the session cookie →
+  `/api/me` 401. **Fixed with `AppendHeaders`** (appends both). Re-verified:
+  bot 22 + core 80 green, clippy zero new. **Roadmap 00–06 complete.**

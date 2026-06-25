@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{AppendHeaders, Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -261,8 +261,15 @@ async fn callback(
     let session_cookie = format!("session={token}; Max-Age={SESSION_TTL_SECS}; Path=/; HttpOnly; SameSite=Lax{secure}");
     // The CSRF state nonce is single-use — clear it now that it has been consumed.
     let clear_state = "oauth_state=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax".to_string();
+    // NOTE: must be `AppendHeaders`, not a plain `[(K, V); N]` array — the array
+    // impl of `IntoResponseParts` *inserts* (overwrites) per key, so a second
+    // `Set-Cookie` would clobber the session cookie. `AppendHeaders` appends, so
+    // both the session cookie and the state-clearing cookie survive.
     (
-        [(header::SET_COOKIE, session_cookie), (header::SET_COOKIE, clear_state)],
+        AppendHeaders([
+            (header::SET_COOKIE, session_cookie),
+            (header::SET_COOKIE, clear_state),
+        ]),
         Redirect::to("/"),
     )
         .into_response()
