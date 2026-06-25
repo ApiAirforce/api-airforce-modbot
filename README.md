@@ -59,6 +59,11 @@ community Discord and is open source so anyone can run it.
   chat) keep it safe. Enabling it sends message text to the configured endpoint.
 - Multi-guild: one instance moderates many servers, each with fully isolated
   config, strikes, jails, and cases.
+- Optional **web dashboard** (off by default): a small UI run inside the bot
+  process (sharing the same database) to configure every per-guild setting in a
+  browser and browse cases/strikes/jails. Discord OAuth login; you only see the
+  servers you have **Manage Server** on and the bot is in. Writes go through the
+  same validation as the slash commands.
 - 36 admin slash commands, gated to bot owners or members with **Manage Server**.
 - Single self-contained binary, an embedded [`redb`](https://github.com/cberner/redb)
   database (one file), and a tiny `config.toml`. No external services.
@@ -169,6 +174,33 @@ Then enable it for a server, choosing the model and (optionally) a policy prompt
 > `daily_cap` bound the spend; if the API is down or the cap is reached the bot
 > **fails open** (it never blocks chat). Exempt channels/roles/users with
 > `/aiexempt`.
+
+### 8. (Optional) Web dashboard
+
+Configure everything in a browser instead of slash commands. It runs **inside
+the bot process** (no second service, no second database) and is **off** until
+you enable it.
+
+1. Discord Developer Portal → your app → **OAuth2**: copy the **Client ID** and
+   **Client Secret**, and add `<base_url>/api/callback` as a **redirect URL**.
+2. Add a `[dashboard]` section to `config.toml`:
+
+```toml
+[dashboard]
+enabled = true
+bind = "127.0.0.1:8080"
+base_url = "https://mod.example.com"   # public URL, no trailing slash
+oauth_client_id = "YOUR_APP_CLIENT_ID"
+oauth_client_secret = "YOUR_OAUTH_SECRET"
+```
+
+3. Restart and open `base_url`. Log in with Discord — you'll only see servers
+   you have **Manage Server** on and the bot is in, then can edit every setting
+   and browse cases / strikes / jails.
+
+> Put it behind HTTPS (a reverse proxy) for any non-local use — the session
+> cookie is marked `Secure` automatically when `base_url` is `https`. Edits use
+> the exact same validation as the slash commands, so the two never disagree.
 
 ## Commands
 

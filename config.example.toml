@@ -23,3 +23,19 @@ owner_ids = []
 
 # Path to the embedded database file (created on first run).
 db_path = "modbot.redb"
+
+# ── Optional web dashboard ───────────────────────────────────────────────────
+# A small web UI (run inside the bot process, sharing this same database) to
+# configure every per-guild setting in a browser instead of slash commands.
+# Leave this section out (or enabled = false) to keep it off.
+#
+# Setup: in the Discord Developer Portal → your app → OAuth2, copy the Client ID
+# and Client Secret, and add  <base_url>/api/callback  as a redirect URL.
+#
+# [dashboard]
+# enabled = true
+# bind = "127.0.0.1:8080"                  # where the HTTP server listens
+# base_url = "https://mod.example.com"     # public URL (no trailing slash); used
+#                                          # to build the OAuth redirect
+# oauth_client_id = "YOUR_APP_CLIENT_ID"
+# oauth_client_secret = "YOUR_OAUTH_SECRET"

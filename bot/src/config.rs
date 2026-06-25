@@ -19,10 +19,62 @@ pub struct BotConfig {
     /// Path to the embedded database file (created on first run).
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    /// Optional web dashboard. Off unless `[dashboard]` is present and enabled.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+/// Web-dashboard bootstrap settings. The dashboard is a small HTTP service run
+/// inside the bot process (sharing the same store); it stays OFF unless this is
+/// enabled and the Discord OAuth credentials are filled in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DashboardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address to bind the HTTP server to.
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    /// Public base URL the dashboard is reached at (used to build the OAuth
+    /// redirect, e.g. `https://mod.example.com`). No trailing slash.
+    #[serde(default)]
+    pub base_url: String,
+    /// Discord application OAuth2 client id + secret (Dev Portal → OAuth2). The
+    /// `<base_url>/api/callback` redirect must be registered there too.
+    #[serde(default)]
+    pub oauth_client_id: String,
+    #[serde(default)]
+    pub oauth_client_secret: String,
 }
 
 fn default_db_path() -> String {
     "modbot.redb".to_string()
+}
+
+fn default_bind() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_bind(),
+            base_url: String::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
+        }
+    }
+}
+
+impl DashboardConfig {
+    /// True only when enabled AND the OAuth credentials + base URL are all set,
+    /// so a half-configured dashboard never starts.
+    pub fn is_ready(&self) -> bool {
+        self.enabled
+            && !self.base_url.trim().is_empty()
+            && !self.oauth_client_id.trim().is_empty()
+            && !self.oauth_client_secret.trim().is_empty()
+    }
 }
 
 impl Default for BotConfig {
@@ -32,6 +84,7 @@ impl Default for BotConfig {
             guild_id: String::new(),
             owner_ids: Vec::new(),
             db_path: default_db_path(),
+            dashboard: DashboardConfig::default(),
         }
     }
 }

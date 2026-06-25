@@ -47,7 +47,7 @@
 | **03** | [Join-Raid / Anti-Nuke](docs/plans/03-join-raid-anti-nuke.md) | No join-gate/verification/lockdown/anti-nuke | ~4–6 d | ◐ code+review done (4 findings fixed); staging-verify pending |
 | **04** | [Persistence & Hardening](docs/plans/04-persistence-hardening.md) | Flood window in-RAM; naive bulk-delete | ~1–2 d | ◐ code+review done (1 low fixed); staging-verify pending |
 | **05** | [AI Moderation via api.airforce](docs/plans/05-ai-moderation-airforce.md) | No context-aware AI moderation (differentiator) | ~2–4 d | ◐ P1–3 code+review done (1 low fixed; mock-tested, no spend); live staging pending |
-| **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ☐ later |
+| **06** | [Web Dashboard](docs/plans/06-web-dashboard.md) | No dashboard (the "premium" of the big bots) | ~5–10 d | ◐ v1 code+review done (mergebar, 0 blocker; 5 low/med fixed); server/auth live-verified; full OAuth-callback test pending |
 | **90** | [Community Breadth (backlog)](docs/plans/90-backlog-community.md) | Leveling/reaction-roles/welcome/tickets/… | ~10–14 d | ⏸ backlog |
 
 **Phase-1 commitment (Moderation-Vollausbau): Plans 00 → 04.** ≈ 3–4 focused
@@ -230,7 +230,7 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
 - *2026-06-24* — **Plan 05 adversarial review (2 lenses + synthesis) → mergebar,
   0 blocker.** Verified: the automod refactor is **byte-identical** (the shared
   `apply_content_action` with `tag="automod"` reproduces `automod [rule]: reason`
-  + every audit/DM/case string → no regression); core stayed dependency-clean
+  and every audit/DM/case string → no regression); core stayed dependency-clean
   (empty `core/Cargo.toml` diff → backend untouched); fail-open on every classify
   error path; **no key leak** (key only in `bearer_auth`, never logged); cost
   guards + exemptions run before any spend; budget row self-resets (no key
@@ -241,3 +241,43 @@ weeks. Plans 05/06 follow on go; Plan 90 is opt-in later.
   kept by design: counting attempts also circuit-breaks a sustained outage;
   documented in `ai_check`.) **bot 18 + core 80 still green**, clippy zero new.
   Pending: live staging (real api.airforce call, with anes).
+- *2026-06-25* — **Plan 05 committed** (`e2104c9`).
+- *2026-06-25* — **Live staging test (Browser MCP, real test Discord) → PASSED;
+  2 fixes committed.** Created a throwaway bot app + server, ran the binary:
+  gateway connect, **36 commands registered**, `/modstatus`, `/setfilter`, a
+  posted link **deleted + struck**, and **AI moderation live** (gpt-4o-mini
+  returned `{flagged,category,confidence}`, message deleted; an invalid model id
+  failed open → no false-delete). Found + fixed `/allowinvite` description >100
+  chars (Discord rejected the WHOLE command batch → no commands registered on any
+  real guild) — committed `211872f`. Added AI verdict logging — committed
+  `9dff4a8`. The "compiled + reviewed" Discord-glue layer is now real-world
+  proven.
+- *2026-06-25* — **Plan 06 (Web Dashboard) v1 code-complete.** `bot/dashboard.rs`
+  — an `axum` HTTP service spawned alongside the gateway, sharing the same
+  `Arc<RedbStore>` (one source of truth, no second DB). Discord **OAuth2** login
+  (identify+guilds), opaque in-memory sessions, and a guild gate (Manage-Server
+  **and** bot-in-guild). API: `GET config` (all 8 sections) + `PUT
+  config/:section` through the **same `core` `validate()`** the slash commands
+  use; `cases`/`strikes`/`jails` reads. Self-contained vanilla SPA
+  (`web/{index.html,app.js,style.css}`, embedded via `include_str!`) with
+  auto-generated per-section forms. Off unless `[dashboard]` is enabled with
+  OAuth creds. New deps: `axum`, `rand` (bot only — core untouched). **Live-smoke
+  verified**: server starts with the bot, serves the SPA, `/api/login` 303→Discord,
+  `/api/me` + `/api/guilds/:id/config` 401 without a session. **bot 22 + core 80
+  green** (+4 dashboard tests), clippy still the 5 pre-existing (zero new).
+  Pending: review + full OAuth-callback live test (needs real OAuth creds).
+- *2026-06-25* — **Plan 06 adversarial security review (2 lenses + synthesis) →
+  mergebar, 0 blocker.** Verified clean: no cross-guild access (`authorize()` is
+  the first statement in every guild endpoint, exact-match against the login
+  guild snapshot — a crafted `:id` can't slip the gate), no secret leak
+  (client-secret only in the token POST, bot token only as a `Bot` auth header,
+  no config blob holds a key, errors echo only serde/validate strings),
+  login-CSRF blocked (HttpOnly `oauth_state` cookie checked on callback), no
+  await-across-lock, no SSRF (fixed Discord URLs), body-limit + capped list
+  limits. **5 low/medium all fixed**: (M) permission staleness — TTL 8h→30 min so
+  a revoked admin loses access fast (silent re-auth keeps it one click); (L)
+  clear the single-use `oauth_state` cookie after the callback; (L) recover a
+  poisoned session mutex (`unwrap_or_else(into_inner)`); (L) documented the
+  ~200-guild single-page fetch (under-grant only); (L) `esc()` two app.js sinks
+  (defense-in-depth). **bot 22 + core 80 still green**, clippy zero new. Pending:
+  full OAuth-callback live test (needs real OAuth creds).

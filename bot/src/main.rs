@@ -7,6 +7,7 @@
 mod ai;
 mod commands;
 mod config;
+mod dashboard;
 mod handler;
 mod invite_filter;
 mod jail;
@@ -72,7 +73,18 @@ async fn main() {
         None => None,
     };
 
-    let handler = Handler::new(store, Arc::new(cfg), ai);
+    let config = Arc::new(cfg);
+
+    // Optional web dashboard — a small axum service sharing the same store. Off
+    // unless [dashboard] is enabled with complete OAuth credentials.
+    if config.dashboard.is_ready() {
+        let (ds_store, ds_config, ds_token) = (store.clone(), config.clone(), token.clone());
+        tokio::spawn(async move { dashboard::serve(ds_store, ds_config, ds_token).await });
+    } else if config.dashboard.enabled {
+        eprintln!("⚠️ [dashboard] enabled but base_url / oauth_client_id / oauth_client_secret are incomplete — not starting it");
+    }
+
+    let handler = Handler::new(store, config, ai);
     let mut client = match Client::builder(&token, intents).event_handler(handler).await {
         Ok(c) => c,
         Err(e) => {
