@@ -761,6 +761,15 @@ impl Handler {
         // Classify (fails open internally) and act only on a confident flag.
         let text = cfg.truncate_for_call(&message.content);
         let verdict = classifier.classify(&text, &cfg.policy, &cfg.model).await;
+        println!(
+            "🤖 ai-mod[{}]: flagged={} category={:?} confidence={}/{} → {}",
+            cfg.model,
+            verdict.flagged,
+            verdict.category,
+            verdict.confidence,
+            cfg.confidence_threshold,
+            if cfg.action_for(&verdict).is_some() { "act" } else { "allow" },
+        );
         let Some(action) = cfg.action_for(&verdict) else {
             return false;
         };
