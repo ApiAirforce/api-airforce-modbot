@@ -19,7 +19,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 chrono = "0.4"
 # Optional web dashboard (off unless [dashboard] is configured): a small axum
 # service in the bot process, sharing the same redb store as the gateway.
-axum = "0.7"
+axum = "0.8"
 rand = "0.8"
 # Resolves dsc.gg vanity redirects (Location header) and backs the AI-moderation
 # classifier call (JSON chat/completions); shares serenity's rustls TLS backend.
