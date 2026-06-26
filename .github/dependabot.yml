@@ -1,5 +1,6 @@
-# Dependabot version updates. Security alerts/fixes live in repo settings;
-# this drives the routine grouped weekly update PRs.
+# Dependabot version updates. Security alerts/fixes live in repo settings.
+# Library semver-major bumps are filtered (handled manually); github-actions
+# majors are kept (low-risk CI updates).
 version: 2
 updates:
   - package-ecosystem: "cargo"
@@ -12,6 +13,9 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
